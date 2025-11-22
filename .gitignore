@@ -42,6 +42,7 @@
 
 # build outputs
 out
+build
 
 # VS
 .vs

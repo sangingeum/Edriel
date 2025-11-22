@@ -6,6 +6,8 @@
 #include <google/protobuf/stubs/common.h>
 #include <grpcpp/grpcpp.h>
 #include <iostream>
+#include "hello.pb.h"
+ 
 
 using namespace std;
 
