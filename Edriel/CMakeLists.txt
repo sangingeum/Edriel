@@ -4,6 +4,7 @@
 find_package(asio CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
+find_package(asio-grpc CONFIG REQUIRED)
 
 function(grpc_generate_cpp srcs hdrs dest)
     if(NOT ARGN)
@@ -62,7 +63,7 @@ add_executable (Edriel
     ${PROTO_HDRS}
 )
 
-target_link_libraries(Edriel PRIVATE asio::asio protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection)
+target_link_libraries(Edriel PRIVATE protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection asio-grpc::asio-grpc-standalone-asio asio::asio)
 target_include_directories(Edriel PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 
@@ -75,7 +76,7 @@ add_executable (Client
     ${GRPC_HDRS}
 )
 
-target_link_libraries(Client PRIVATE asio::asio protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection)
+target_link_libraries(Client PRIVATE protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection asio-grpc::asio-grpc-standalone-asio asio::asio)
 target_include_directories(Client PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 # Client
@@ -87,7 +88,7 @@ add_executable (Server
     ${GRPC_HDRS}
 )
 
-target_link_libraries(Server PRIVATE asio::asio protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection)
+target_link_libraries(Server PRIVATE protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection asio-grpc::asio-grpc-standalone-asio asio::asio)
 target_include_directories(Server PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 
