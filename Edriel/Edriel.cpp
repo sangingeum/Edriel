@@ -2,26 +2,20 @@
 //
 
 #include "Edriel.hpp"
-#include <asio.hpp>
-#include <google/protobuf/stubs/common.h>
-#include <grpcpp/grpcpp.h>
-#include <iostream>
-#include "hello.pb.h"
- 
 
-using namespace std;
 
 int main()
 {
     // Asio test
     asio::io_context io;
-    cout << "Asio io_context created." << endl;
-
+    std::cout << "Asio io_context created." << std::endl;
+    Edriel edriel(io);
     // Protobuf test
-    cout << "Protobuf version: " << GOOGLE_PROTOBUF_VERSION << endl;
+    std::cout << "Protobuf version: " << GOOGLE_PROTOBUF_VERSION << std::endl;
 
     // gRPC test
-    cout << "gRPC version: " << grpc::Version() << endl;
+    std::cout << "gRPC version: " << grpc::Version() << std::endl;
+	io.run();
 
 	return 0;
 }
