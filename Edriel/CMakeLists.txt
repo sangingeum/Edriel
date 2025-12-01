@@ -61,42 +61,16 @@ add_executable (Edriel
     "Edriel.hpp" 
     ${PROTO_SRCS}
     ${PROTO_HDRS}
+    ${GRPC_SRCS}
+    ${GRPC_HDRS}
 )
 
 target_link_libraries(Edriel PRIVATE protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection asio-grpc::asio-grpc-standalone-asio asio::asio)
 target_include_directories(Edriel PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 
-# Server
-add_executable (Client 
-    "Client.cpp" 
-    ${PROTO_SRCS}
-    ${PROTO_HDRS}
-    ${GRPC_SRCS}
-    ${GRPC_HDRS}
-)
-
-target_link_libraries(Client PRIVATE protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection asio-grpc::asio-grpc-standalone-asio asio::asio)
-target_include_directories(Client PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-
-# Client
-add_executable (Server 
-    "Server.cpp" 
-    ${PROTO_SRCS}
-    ${PROTO_HDRS}
-    ${GRPC_SRCS}
-    ${GRPC_HDRS}
-)
-
-target_link_libraries(Server PRIVATE protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection asio-grpc::asio-grpc-standalone-asio asio::asio)
-target_include_directories(Server PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-
-
-
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET Edriel PROPERTY CXX_STANDARD 20)
-  set_property(TARGET Client PROPERTY CXX_STANDARD 20)
-  set_property(TARGET Server PROPERTY CXX_STANDARD 20)
 endif()
 
 # TODO: 필요한 경우 테스트를 추가하고 대상을 설치합니다.
