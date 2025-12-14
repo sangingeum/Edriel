@@ -20,8 +20,7 @@ private:
     // --- Configuration ----------------------------------------------------
     static constexpr uint16_t commonPort{ 30002 };
     static constexpr std::string_view multicastAddress{ "239.255.0.1" };
-    static constexpr std::size_t  recvBufferSize{ 1024 };
-    static constexpr std::string_view packet{ "Discovery Packet" };
+    static constexpr std::size_t  recvBufferSize{ 1500 };
     static constexpr std::chrono::seconds autoDiscoveryPeriod{ 2 };
 
     asio::io_context& io_context;
@@ -34,6 +33,7 @@ private:
     asio::ip::udp::endpoint           multicastEndpoint{ asio::ip::address_v4::from_string(std::string(multicastAddress)), commonPort };
 
     std::array<char, recvBufferSize> recvBuffer;
+    std::string packet{ "Discovery Packet" };
 
     // --- Control flags ------------------------------------------------------
     std::atomic_bool                    isRunning{ false };
@@ -58,7 +58,7 @@ private:
         autoDiscoveryTimer.async_wait([this](const asio::error_code& ec) {
             if (!ec) {
                 autoDiscoverySocket.async_send_to(
-                    asio::buffer(packet), multicastEndpoint,
+                    asio::buffer(packet, packet.size()), multicastEndpoint,
                     [](const asio::error_code& ec, std::size_t /*n*/) {
                         if (ec) std::cerr << "Send failed: " << ec.message() << '\n';
                     });
@@ -75,6 +75,11 @@ public:
           autoDiscoverySocket(io_ctx),
           autoDiscoveryTimer(io_ctx)
     {
+        // Initialize Discovery Packet --------------------------------
+        // Add a random unique identifier, PID, and thread ID
+        packet += "_PID_" + std::to_string(static_cast<unsigned long>(::_getpid()));
+        packet += "_UID_" + std::to_string(std::hash<std::string>{}(std::to_string(std::rand())));
+        packet += std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
         // Socket options ---------------------------------------------------
         autoDiscoverySocket.open(receiverEndpoint.protocol());
         autoDiscoverySocket.set_option(asio::socket_base::reuse_address(true));
