@@ -5,6 +5,7 @@
 #include <google/protobuf/stubs/common.h>
 #include <grpcpp/grpcpp.h>
 #include "hello.pb.h"
+#include "autoDiscovery.pb.h"
 #include <string>
 #include <string_view>
 #include <functional>
@@ -33,19 +34,28 @@ private:
     asio::ip::udp::endpoint           multicastEndpoint{ asio::ip::address_v4::from_string(std::string(multicastAddress)), commonPort };
 
     std::array<char, recvBufferSize> recvBuffer;
-    std::string packet{ "Discovery Packet" };
+    autoDiscovery::Identifier discoveryMessage;
+    std::string packet;
 
     // --- Control flags ------------------------------------------------------
     std::atomic_bool                    isRunning{ false };
     std::mutex                          runnerMutex;
+
+    // --- Random‑number generator --------------------------------------------
 
     void startAutoDiscoveryReceiver() {
         autoDiscoverySocket.async_receive_from(
             asio::buffer(recvBuffer), senderEndpoint,
             [this](const asio::error_code& ec, std::size_t n) {
                 if (!ec) {
-                    std::cout << "[Recv] From " << senderEndpoint << " : "
-                              << std::string(recvBuffer.data(), n) << '\n';
+                    autoDiscovery::Identifier receivedMessage;
+                    if(receivedMessage.ParseFromArray(recvBuffer.data(), static_cast<int>(n))){
+                        std::cout << "[Recv] PID: " << receivedMessage.pid()
+                                  << ", TID: " << receivedMessage.tid()
+                                  << ", UID: " << receivedMessage.uid() << '\n';
+                    } else {
+                        std::cerr << "Failed to parse received message.\n";
+                    }
                 } else {
                     std::cerr << "Receive error: " << ec.message() << '\n';
                 }
@@ -75,11 +85,16 @@ public:
           autoDiscoverySocket(io_ctx),
           autoDiscoveryTimer(io_ctx)
     {
+        thread_local static std::random_device                      rd;
+        thread_local static std::mt19937_64                         generator(rd());
+        thread_local static std::uniform_int_distribution<uint64_t> dist(0, std::numeric_limits<uint64_t>::max());
+
         // Initialize Discovery Packet --------------------------------
-        // Add a random unique identifier, PID, and thread ID
-        packet += "_PID_" + std::to_string(static_cast<unsigned long>(::_getpid()));
-        packet += "_UID_" + std::to_string(std::hash<std::string>{}(std::to_string(std::rand())));
-        packet += std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        discoveryMessage.set_pid(static_cast<unsigned long>(::_getpid()));
+        discoveryMessage.set_tid(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        discoveryMessage.set_uid(dist(generator));
+        packet = discoveryMessage.SerializeAsString();
+    
         // Socket options ---------------------------------------------------
         autoDiscoverySocket.open(receiverEndpoint.protocol());
         autoDiscoverySocket.set_option(asio::socket_base::reuse_address(true));

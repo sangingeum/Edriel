@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package autoDiscovery;
+message Identifier {
+  uint32 pid = 1;
+  uint64 tid = 2;
+  uint64 uid = 3;
+}
