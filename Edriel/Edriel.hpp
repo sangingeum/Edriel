@@ -75,6 +75,7 @@ private:
 
     // -- Participant Info ---------------------------------------------------
     std::set<Participant> participants;
+    Participant selfParticipant{0,0,0}; // placeholder
 
     // --- Internal Methods ---------------------------------------------------
     bool hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) const;

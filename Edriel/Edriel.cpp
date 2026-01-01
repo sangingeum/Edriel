@@ -140,6 +140,11 @@ void Edriel::initializeAutoDiscovery() {
 
 void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid){
     Participant incomingParticipant(pid, tid, uid);
+    if(incomingParticipant == selfParticipant){
+        // Ignore self messages
+        return;
+    }
+
     auto it = participants.find(incomingParticipant);
     if(it != participants.end()){
         // Update last seen timestamp
@@ -180,6 +185,7 @@ Edriel::Edriel(asio::io_context& io_ctx)
     discoveryMessage.set_tid(std::hash<std::thread::id>{}(std::this_thread::get_id()));
     discoveryMessage.set_uid(dist(generator));
     discoveryPacket = discoveryMessage.SerializeAsString();
+    selfParticipant = Participant(discoveryMessage.pid(), discoveryMessage.tid(), discoveryMessage.uid());
     // Attach magic number at the beginning
     uint32_t networkMagicNumber = htonl(magicNumber);
     discoveryPacket.insert(0, reinterpret_cast<const char*>(&networkMagicNumber), sizeof(networkMagicNumber));
