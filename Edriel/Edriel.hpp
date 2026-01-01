@@ -45,12 +45,10 @@ private:
     std::mutex                          runnerMutex;
 
     // --- Random‑number generator --------------------------------------------
-
-    bool hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) {
+    bool hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) const {
         if (length < magicNumberSize) return false;
-        uint32_t receivedMagicNumber;
-        std::memcpy(&receivedMagicNumber, buffer->data(), magicNumberSize);
-        receivedMagicNumber = ntohl(receivedMagicNumber);
+        auto rawBytes = *reinterpret_cast<const std::array<char, magicNumberSize>*>(buffer->data());
+        uint32_t receivedMagicNumber = ntohl(std::bit_cast<uint32_t>(rawBytes));
         return receivedMagicNumber == magicNumber;
     }
 
@@ -93,7 +91,7 @@ private:
             std::bind(&Edriel::handleAutoDiscoveryReceive, this, buffer, std::placeholders::_1, std::placeholders::_2));
     }
 
-    void startAutoDiscoverySender(std::shared_ptr<Buffer> buffer = std::make_shared<Buffer>()) {
+    void startAutoDiscoverySender() {
         if(!autoDiscoverySocket || !autoDiscoveryTimer) {
             std::cerr << "Auto-discovery components are not initialized.\n";
             return;
@@ -105,23 +103,22 @@ private:
         }
 
         autoDiscoveryTimer->expires_after(autoDiscoveryPeriod);
-        autoDiscoveryTimer->async_wait([this, buffer](const asio::error_code& ec) {
+        autoDiscoveryTimer->async_wait([this](const asio::error_code& ec) {
             if (!ec) {
                 autoDiscoverySocket->async_send_to(
                     asio::buffer(discoveryPacket, discoveryPacket.size()), multicastEndpoint,
                     [](const asio::error_code& ec, std::size_t /*n*/) {
                         if (ec) std::cerr << "Send failed: " << ec.message() << '\n';
                     });
-                startAutoDiscoverySender(buffer);  // keep sending
+                startAutoDiscoverySender();  // keep sending
             } else {
                 std::cerr << "Timer error: " << ec.message() << '\n';
             }
         });
     }
 
-    void initializeAutoDiscovery() {
+    void stopAutoDiscoverySocketAndTimer(){
         asio::error_code ec;
-        std::cout << "Initializing Auto-Discovery components...\n";
         if(autoDiscoverySocket && autoDiscoverySocket->is_open()) {
             autoDiscoverySocket->close(ec);
             if (ec) {
@@ -134,6 +131,11 @@ private:
                 std::cerr << "Error cancelling existing timer: " << ec.message() << '\n';
             }
         }
+    }
+
+    void initializeAutoDiscovery() {
+        // Clean up existing socket and timer if any ------------------------
+        stopAutoDiscoverySocketAndTimer();
         // Create socket and timer ---------------------------------------------
         autoDiscoverySocket = std::make_unique<asio::ip::udp::socket>(io_context);
         autoDiscoveryTimer = std::make_unique<asio::steady_timer>(io_context);
@@ -170,8 +172,6 @@ public:
         // Attach magic number at the beginning
         uint32_t networkMagicNumber = htonl(magicNumber);
         discoveryPacket.insert(0, reinterpret_cast<const char*>(&networkMagicNumber), sizeof(networkMagicNumber));
-        // Initialize Auto-Discovery --------------------------------
-        initializeAutoDiscovery();
     
         std::cout << "Edriel initialized.\n";
     }
@@ -181,6 +181,9 @@ public:
         if(isRunning.load()) return;
         std::cout << "Starting Auto-Discovery...\n";
         isRunning.store(true);
+        // Initialize Auto-Discovery --------------------------------
+        initializeAutoDiscovery();
+        // Start Sender and Receiver -------------------------------
         startAutoDiscoverySender();
         startAutoDiscoveryReceiver();
     }
@@ -190,7 +193,7 @@ public:
         if(!isRunning.load()) return;
         std::cout << "Stopping Auto-Discovery...\n";
         isRunning.store(false);
-        initializeAutoDiscovery();
+        stopAutoDiscoverySocketAndTimer();
     }
 
     ~Edriel() { stopAutoDiscovery(); }
