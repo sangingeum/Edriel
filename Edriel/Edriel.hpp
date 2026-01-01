@@ -13,8 +13,6 @@
 #include <cstddef>
 #include <mutex>
 
-// TODO: Use magic number
-// TODO : Use smart pointers for autoDiscovery socket and timer
 class Edriel {
 private:
 
@@ -23,6 +21,9 @@ private:
     static constexpr std::string_view multicastAddress{ "239.255.0.1" };
     static constexpr std::size_t  recvBufferSize{ 1500 };
     static constexpr std::chrono::seconds autoDiscoveryPeriod{ 2 };
+    // magic number, 4 bytes
+    static constexpr uint32_t   magicNumber{ 0xED75E1ED };
+    static constexpr std::size_t  magicNumberSize{ sizeof(magicNumber) };
 
     using Buffer = std::array<char, recvBufferSize>;
 
@@ -45,10 +46,25 @@ private:
 
     // --- Random‑number generator --------------------------------------------
 
+    bool hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) {
+        if (length < magicNumberSize) return false;
+        uint32_t receivedMagicNumber;
+        std::memcpy(&receivedMagicNumber, buffer->data(), magicNumberSize);
+        receivedMagicNumber = ntohl(receivedMagicNumber);
+        return receivedMagicNumber == magicNumber;
+    }
+
     void handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const asio::error_code& ec, std::size_t bytesTransferred) {
         if (!ec) {
+            // Handle magic number
+            if(!hasValidMagicNumber(buffer, bytesTransferred)){
+                std::cerr << "Invalid magic number received. Discarding packet.\n";
+                startAutoDiscoveryReceiver(buffer);  // continue looping
+                return;
+            }
+        
             autoDiscovery::Identifier receivedMessage;
-            if(receivedMessage.ParseFromArray(buffer->data(), static_cast<int>(bytesTransferred))){
+            if(receivedMessage.ParseFromArray(buffer->data() + magicNumberSize, static_cast<int>(bytesTransferred - magicNumberSize))) {
                 std::cout << "[Recv] PID: " << receivedMessage.pid()
                           << ", TID: " << receivedMessage.tid()
                           << ", UID: " << receivedMessage.uid() << '\n';
@@ -89,14 +105,14 @@ private:
         }
 
         autoDiscoveryTimer->expires_after(autoDiscoveryPeriod);
-        autoDiscoveryTimer->async_wait([this](const asio::error_code& ec) {
+        autoDiscoveryTimer->async_wait([this, buffer](const asio::error_code& ec) {
             if (!ec) {
                 autoDiscoverySocket->async_send_to(
                     asio::buffer(discoveryPacket, discoveryPacket.size()), multicastEndpoint,
                     [](const asio::error_code& ec, std::size_t /*n*/) {
                         if (ec) std::cerr << "Send failed: " << ec.message() << '\n';
                     });
-                startAutoDiscoverySender();  // keep sending
+                startAutoDiscoverySender(buffer);  // keep sending
             } else {
                 std::cerr << "Timer error: " << ec.message() << '\n';
             }
@@ -151,6 +167,9 @@ public:
         discoveryMessage.set_tid(std::hash<std::thread::id>{}(std::this_thread::get_id()));
         discoveryMessage.set_uid(dist(generator));
         discoveryPacket = discoveryMessage.SerializeAsString();
+        // Attach magic number at the beginning
+        uint32_t networkMagicNumber = htonl(magicNumber);
+        discoveryPacket.insert(0, reinterpret_cast<const char*>(&networkMagicNumber), sizeof(networkMagicNumber));
         // Initialize Auto-Discovery --------------------------------
         initializeAutoDiscovery();
     
