@@ -105,6 +105,7 @@ private:
 
     void initializeAutoDiscovery() {
         asio::error_code ec;
+        std::cout << "Initializing Auto-Discovery components...\n";
         if(autoDiscoverySocket && autoDiscoverySocket->is_open()) {
             autoDiscoverySocket->close(ec);
             if (ec) {
@@ -117,16 +118,16 @@ private:
                 std::cerr << "Error cancelling existing timer: " << ec.message() << '\n';
             }
         }
-
         // Create socket and timer ---------------------------------------------
         autoDiscoverySocket = std::make_unique<asio::ip::udp::socket>(io_context);
         autoDiscoveryTimer = std::make_unique<asio::steady_timer>(io_context);
-
         // Socket options ---------------------------------------------------
         autoDiscoverySocket->open(receiverEndpoint.protocol());
-        autoDiscoverySocket->bind(receiverEndpoint);
         autoDiscoverySocket->set_option(asio::socket_base::reuse_address(true));
         autoDiscoverySocket->set_option(asio::ip::multicast::enable_loopback(true));
+        // Socket bind ------------------------------------------------------
+        autoDiscoverySocket->bind(receiverEndpoint);
+        
         // Join multicast group ---------------------------------------------
         try {
             autoDiscoverySocket->set_option(
@@ -144,16 +145,15 @@ public:
         thread_local static std::random_device                      rd;
         thread_local static std::mt19937_64                         generator(rd());
         thread_local static std::uniform_int_distribution<uint64_t> dist(0, std::numeric_limits<uint64_t>::max());
-
+        std::cout << "Initializing Edriel...\n";
         // Initialize Discovery Packet --------------------------------
         discoveryMessage.set_pid(static_cast<unsigned long>(::_getpid()));
         discoveryMessage.set_tid(std::hash<std::thread::id>{}(std::this_thread::get_id()));
         discoveryMessage.set_uid(dist(generator));
         discoveryPacket = discoveryMessage.SerializeAsString();
-        
         // Initialize Auto-Discovery --------------------------------
         initializeAutoDiscovery();
-
+    
         std::cout << "Edriel initialized.\n";
     }
 
