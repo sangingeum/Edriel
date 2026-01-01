@@ -21,6 +21,7 @@ void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const as
             std::cout << "[Recv] PID: " << receivedMessage.pid()
                         << ", TID: " << receivedMessage.tid()
                         << ", UID: " << receivedMessage.uid() << '\n';
+            handleParticipantHeartbeat(receivedMessage.pid(), receivedMessage.tid(), receivedMessage.uid());
         } else {
             std::cerr << "Failed to parse received message.\n";
         }
@@ -47,6 +48,7 @@ void Edriel::startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer) {
 }
 
 void Edriel::startAutoDiscoverySender() {
+    // Send Auto-Discovery Packet ------------------------
     if(!autoDiscoverySocket || !autoDiscoveryTimer) {
         std::cerr << "Auto-discovery components are not initialized.\n";
         return;
@@ -70,6 +72,9 @@ void Edriel::startAutoDiscoverySender() {
             std::cerr << "Timer error: " << ec.message() << '\n';
         }
     });
+
+    // Check for timed-out participants
+    removeTimedOutParticipants();
 }
 
 void Edriel::stopAutoDiscoverySocketAndTimer(){
@@ -111,6 +116,35 @@ void Edriel::initializeAutoDiscovery() {
     }
 }
 
+void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid){
+    Participant incomingParticipant(pid, tid, uid);
+    auto it = participants.find(incomingParticipant);
+    if(it != participants.end()){
+        // Update last seen timestamp
+        it->updateLastSeen();
+    } else {
+        // New participant
+        participants.insert(incomingParticipant);
+        std::cout << "New participant added: PID: " << pid
+                  << ", TID: " << tid
+                  << ", UID: " << uid << '\n';
+    }
+}
+
+void Edriel::removeTimedOutParticipants(){
+    for(auto it = participants.begin(); it != participants.end(); ) {
+        if(it->shouldBeRemoved()) {
+            std::cout << "Removing timed-out participant PID: " << it->pid
+                      << ", TID: " << it->tid
+                      << ", UID: " << it->uid << '\n';
+            it = participants.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+
 Edriel::Edriel(asio::io_context& io_ctx)
         : io_context(io_ctx)
 {
@@ -151,3 +185,5 @@ void Edriel::stopAutoDiscovery() {
 }
 
 Edriel::~Edriel() { stopAutoDiscovery(); }
+
+

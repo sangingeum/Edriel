@@ -4,7 +4,6 @@
 #include <asio.hpp>
 #include <google/protobuf/stubs/common.h>
 #include <grpcpp/grpcpp.h>
-#include "hello.pb.h"
 #include "autoDiscovery.pb.h"
 #include <string>
 #include <string_view>
@@ -12,8 +11,38 @@
 #include <array>
 #include <cstddef>
 #include <mutex>
+#include <bit>
+#include <set>
+
+// TODO: Participant management (list of known participants)
+//      - Add participant struct with PID, TID, UID, last seen timestamp
+//      - Drop participants not seen for a certain timeout period
 
 class Edriel {
+public:
+    struct Participant {
+            public:
+            unsigned long pid;
+            uint64_t tid;
+            uint64_t uid;
+            mutable std::chrono::steady_clock::time_point lastSeen;
+            static constexpr std::chrono::seconds timeoutPeriod{ 10 };
+            
+            Participant(unsigned long p, uint64_t t, uint64_t u)
+                : pid(p), tid(t), uid(u), lastSeen(std::chrono::steady_clock::now()) {}
+            bool shouldBeRemoved() const {
+                return (std::chrono::steady_clock::now() - lastSeen) > timeoutPeriod;
+            }
+            void updateLastSeen() const {
+                lastSeen = std::chrono::steady_clock::now();
+            }
+            bool operator==(const Participant& other) const {
+                return pid == other.pid && tid == other.tid && uid == other.uid;
+            }
+            bool operator<(const Participant& other) const {
+                return std::tie(pid, tid, uid) < std::tie(other.pid, other.tid, other.uid);
+            }
+        };
 private:
 
     // --- Configuration ----------------------------------------------------
@@ -21,7 +50,7 @@ private:
     static constexpr std::string_view multicastAddress{ "239.255.0.1" };
     static constexpr std::size_t  recvBufferSize{ 1500 };
     static constexpr std::chrono::seconds autoDiscoveryPeriod{ 2 };
-    // magic number, 4 bytes
+    // --- Magic number, 4 bytes --------------------------------------------
     static constexpr uint32_t   magicNumber{ 0xED75E1ED };
     static constexpr std::size_t  magicNumberSize{ sizeof(magicNumber) };
 
@@ -43,12 +72,21 @@ private:
     std::atomic_bool                    isRunning{ false };
     std::mutex                          runnerMutex;
 
+    // -- Participant Info ---------------------------------------------------
+    std::set<Participant> participants;
+
+    // --- Internal Methods ---------------------------------------------------
     bool hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) const;
     void handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const asio::error_code& ec, std::size_t bytesTransferred);
     void startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer = std::make_shared<Buffer>());
     void startAutoDiscoverySender();
     void stopAutoDiscoverySocketAndTimer();
     void initializeAutoDiscovery();
+
+    // --- Participant Management -----------------------------------------------
+    void handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid);
+    void removeTimedOutParticipants();
+
 public:
     Edriel(asio::io_context& io_ctx);
     void startAutoDiscovery();
