@@ -56,7 +56,8 @@ protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
 grpc_generate_cpp(GRPC_SRCS GRPC_HDRS ${CMAKE_CURRENT_BINARY_DIR} ${PROTO_FILES})
 
 # 이 프로젝트의 실행 파일에 소스를 추가합니다.
-add_executable (Edriel 
+add_executable (Edriel
+    "main.cpp"
     "Edriel.cpp" 
     "Edriel.hpp" 
     ${PROTO_SRCS}
