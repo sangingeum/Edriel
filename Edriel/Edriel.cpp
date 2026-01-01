@@ -32,7 +32,7 @@ void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const as
 }
 
 void Edriel::startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer) {
-    if(!autoDiscoverySocket || !autoDiscoveryTimer) {
+    if(!autoDiscoverySocket || !autoDiscoverySendTimer) {
         std::cerr << "Auto-discovery components are not initialized.\n";
         return;
     }
@@ -44,12 +44,12 @@ void Edriel::startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer) {
 
     autoDiscoverySocket->async_receive_from(
         asio::buffer(buffer->data(), buffer->size()), senderEndpoint, 
-        std::bind(&Edriel::handleAutoDiscoveryReceive, this, buffer, std::placeholders::_1, std::placeholders::_2));
+        asio::bind_executor(strand, std::bind(&Edriel::handleAutoDiscoveryReceive, this, buffer, std::placeholders::_1, std::placeholders::_2)));
 }
 
 void Edriel::startAutoDiscoverySender() {
     // Send Auto-Discovery Packet ------------------------
-    if(!autoDiscoverySocket || !autoDiscoveryTimer) {
+    if(!autoDiscoverySocket || !autoDiscoverySendTimer) {
         std::cerr << "Auto-discovery components are not initialized.\n";
         return;
     }
@@ -59,8 +59,8 @@ void Edriel::startAutoDiscoverySender() {
         return;
     }
 
-    autoDiscoveryTimer->expires_after(autoDiscoveryPeriod);
-    autoDiscoveryTimer->async_wait([this](const asio::error_code& ec) {
+    autoDiscoverySendTimer->expires_after(autoDiscoverySendPeriod);
+    autoDiscoverySendTimer->async_wait([this](const asio::error_code& ec) {
         if (!ec) {
             autoDiscoverySocket->async_send_to(
                 asio::buffer(discoveryPacket, discoveryPacket.size()), multicastEndpoint,
@@ -72,9 +72,24 @@ void Edriel::startAutoDiscoverySender() {
             std::cerr << "Timer error: " << ec.message() << '\n';
         }
     });
+}
 
-    // Check for timed-out participants
-    removeTimedOutParticipants();
+void Edriel::startAutoDiscoveryCleaner() {
+    // Clean up timed-out participants ------------------------
+    if(!autoDiscoveryCleanUpTimer) {
+        std::cerr << "Auto-discovery cleaner timer is not initialized.\n";
+        return;
+    }
+
+    autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanUpPeriod);
+    autoDiscoveryCleanUpTimer->async_wait(asio::bind_executor(strand, [this](const asio::error_code& ec) {
+        if (!ec) {
+            removeTimedOutParticipants();
+            startAutoDiscoveryCleaner();  // keep cleaning
+        } else {
+            std::cerr << "Cleaner timer error: " << ec.message() << '\n';
+        }
+    }));
 }
 
 void Edriel::stopAutoDiscoverySocketAndTimer(){
@@ -85,12 +100,18 @@ void Edriel::stopAutoDiscoverySocketAndTimer(){
             std::cerr << "Error closing existing socket: " << ec.message() << '\n';
         }
     }
-    if(autoDiscoveryTimer){
-        autoDiscoveryTimer->cancel();
+    if(autoDiscoverySendTimer){
+        autoDiscoverySendTimer->cancel();
         if (ec) {
             std::cerr << "Error cancelling existing timer: " << ec.message() << '\n';
         }
     }
+    if(autoDiscoveryCleanUpTimer){
+        autoDiscoveryCleanUpTimer->cancel();
+        if (ec) {
+            std::cerr << "Error cancelling existing timer: " << ec.message() << '\n';
+        }
+    }   
 }
 
 void Edriel::initializeAutoDiscovery() {
@@ -98,7 +119,8 @@ void Edriel::initializeAutoDiscovery() {
     stopAutoDiscoverySocketAndTimer();
     // Create socket and timer ---------------------------------------------
     autoDiscoverySocket = std::make_unique<asio::ip::udp::socket>(io_context);
-    autoDiscoveryTimer = std::make_unique<asio::steady_timer>(io_context);
+    autoDiscoverySendTimer = std::make_unique<asio::steady_timer>(io_context);
+    autoDiscoveryCleanUpTimer = std::make_unique<asio::steady_timer>(io_context);   
     // Socket options ---------------------------------------------------
     autoDiscoverySocket->open(receiverEndpoint.protocol());
     autoDiscoverySocket->set_option(asio::socket_base::reuse_address(true));
@@ -146,7 +168,8 @@ void Edriel::removeTimedOutParticipants(){
 
 
 Edriel::Edriel(asio::io_context& io_ctx)
-        : io_context(io_ctx)
+        : io_context{io_ctx},
+          strand{asio::make_strand(io_ctx)}
 {
     thread_local static std::random_device                      rd;
     thread_local static std::mt19937_64                         generator(rd());
@@ -174,6 +197,7 @@ void Edriel::startAutoDiscovery() {
     // Start Sender and Receiver -------------------------------
     startAutoDiscoverySender();
     startAutoDiscoveryReceiver();
+    startAutoDiscoveryCleaner();
 }
 
 void Edriel::stopAutoDiscovery() {

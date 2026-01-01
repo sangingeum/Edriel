@@ -49,18 +49,19 @@ private:
     static constexpr uint16_t commonPort{ 30002 };
     static constexpr std::string_view multicastAddress{ "239.255.0.1" };
     static constexpr std::size_t  recvBufferSize{ 1500 };
-    static constexpr std::chrono::seconds autoDiscoveryPeriod{ 2 };
+    static constexpr std::chrono::seconds autoDiscoverySendPeriod{ 2 };
+    static constexpr std::chrono::seconds autoDiscoveryCleanUpPeriod{ 5 };
     // --- Magic number, 4 bytes --------------------------------------------
     static constexpr uint32_t   magicNumber{ 0xED75E1ED };
     static constexpr std::size_t  magicNumberSize{ sizeof(magicNumber) };
-
     using Buffer = std::array<char, recvBufferSize>;
-
+    // --- ASIO Context ------------------------------------------------------
     asio::io_context& io_context;
-
+    asio::strand<asio::io_context::executor_type> strand;  // for protecting participants
     // --- Socket / timer (plain objects, not shared_ptrs) -------------------
     std::unique_ptr<asio::ip::udp::socket> autoDiscoverySocket{};
-    std::unique_ptr<asio::steady_timer> autoDiscoveryTimer{};
+    std::unique_ptr<asio::steady_timer> autoDiscoverySendTimer{};
+    std::unique_ptr<asio::steady_timer> autoDiscoveryCleanUpTimer{};
     asio::ip::udp::endpoint           receiverEndpoint{ asio::ip::address_v4::any(), commonPort };
     asio::ip::udp::endpoint           senderEndpoint{};
     asio::ip::udp::endpoint           multicastEndpoint{ asio::ip::address_v4::from_string(std::string(multicastAddress)), commonPort };
@@ -80,6 +81,7 @@ private:
     void handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const asio::error_code& ec, std::size_t bytesTransferred);
     void startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer = std::make_shared<Buffer>());
     void startAutoDiscoverySender();
+    void startAutoDiscoveryCleaner();
     void stopAutoDiscoverySocketAndTimer();
     void initializeAutoDiscovery();
 
