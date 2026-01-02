@@ -31,11 +31,22 @@ void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const as
                 handleParticipantHeartbeat(parsedMessage.pid(), parsedMessage.tid(), parsedMessage.uid());
                 break;
             }
-            case autoDiscovery::Message::kTopic:{
+            case autoDiscovery::Message::kAdvertisement:{
                 // Handle topic
-                autoDiscovery::Topic parsedMessage = receivedMessage.topic();
-                std::cout << "[Recv] Topic Name: " << parsedMessage.topic_name()
-                          << ", Message Type: " << parsedMessage.message_type() << '\n';
+                autoDiscovery::TopicAdvertisement parsedMessage = receivedMessage.advertisement();
+                std::cout  << "[Recv] PID: " << parsedMessage.identifier().pid()
+                           << ", TID: " << parsedMessage.identifier().tid()
+                           << ", UID: " << parsedMessage.identifier().uid()
+                           << ", Topic Name: " << parsedMessage.topic().topic_name()
+                           << ", Message Type: " << parsedMessage.topic().message_type() << '\n';
+                handleTopicAnnouncement(
+                    parsedMessage.identifier().pid(),
+                    parsedMessage.identifier().tid(),
+                    parsedMessage.identifier().uid(),
+                    parsedMessage.topic().topic_name(),
+                    parsedMessage.topic().message_type(),
+                    parsedMessage.topic().is_publisher()
+                );
                 break;
             }
             default:
@@ -87,11 +98,15 @@ void Edriel::startAutoDiscoverySender() {
                 [](const asio::error_code& ec, std::size_t /*n*/) {
                     if (ec) std::cerr << "Send failed: " << ec.message() << '\n';
                 });
-            // Send topic packet (TODO)
+            // Send topic packet (TODO) 
             autoDiscovery::Message topicMessage;
-            auto* topic = topicMessage.mutable_topic(); // ensure the oneof is set to topic
-            topic->set_topic_name("example/topic-name"); // example topic name
-            topic->set_message_type("example.MessageType"); // example message type
+            auto* advertisement = topicMessage.mutable_advertisement(); 
+            advertisement->mutable_identifier()->set_pid(discoveryMessage.identifier().pid());
+            advertisement->mutable_identifier()->set_tid(discoveryMessage.identifier().tid());
+            advertisement->mutable_identifier()->set_uid(discoveryMessage.identifier().uid());
+            advertisement->mutable_topic()->set_topic_name("example/topic-name"); // example topic name
+            advertisement->mutable_topic()->set_message_type("example.MessageType"); // example message type
+            advertisement->mutable_topic()->set_is_publisher(false); // example as subscriber
             std::shared_ptr<std::string> topicPacket = std::make_shared<std::string>(topicMessage.SerializeAsString());
             // Attach magic number at the beginning
             prependMagicNumberToPacket(*topicPacket);
@@ -205,6 +220,57 @@ void Edriel::removeTimedOutParticipants(){
     }
 }
 
+void Edriel::handleTopicAnnouncement(unsigned long pid, uint64_t tid, uint64_t uid, const std::string& topicName, const std::string& messageType, bool isPublisher){
+    Participant incomingParticipant(pid, tid, uid);
+    if(incomingParticipant == selfParticipant){ // Ignore self messages
+        return;
+    }
+
+    auto it = participants.find(incomingParticipant);
+    if(it != participants.end()){
+        // Update last seen timestamp
+        it->updateLastSeen();
+        TopicInfo topicInfo(topicName, messageType);
+        if(isPublisher){
+            auto result = it->publishedTopics.insert(topicInfo);
+            if(result.second == true){
+                std::cout << "Participant PID: " << pid
+                      << ", TID: " << tid
+                      << ", UID: " << uid
+                      << " published topic: " << topicName
+                      << " of type: " << messageType << '\n';
+            }
+            
+        } else {
+            auto result = it->subscribedTopics.insert(topicInfo);
+            if(result.second == true){
+                std::cout << "Participant PID: " << pid
+                      << ", TID: " << tid
+                      << ", UID: " << uid
+                      << " subscribed to topic: " << topicName
+                      << " of type: " << messageType << '\n';
+            }
+        }
+    } else {
+        // New participant (should not happen without heartbeat)
+        handleParticipantHeartbeat(pid, tid, uid);
+        std::cout << "New participant added via topic announcement: PID: " << pid
+                  << ", TID: " << tid
+                  << ", UID: " << uid << '\n';
+    }
+}
+
+bool Edriel::hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) const {
+    if (length < magicNumberSize) return false;
+    auto rawBytes = *reinterpret_cast<const std::array<char, magicNumberSize>*>(buffer->data());
+    uint32_t receivedMagicNumber = ntohl(std::bit_cast<uint32_t>(rawBytes));
+    return receivedMagicNumber == magicNumber;
+}
+
+void Edriel::prependMagicNumberToPacket(std::string& packet) const {
+    uint32_t networkMagicNumber = htonl(magicNumber);
+    packet.insert(0, reinterpret_cast<const char*>(&networkMagicNumber), sizeof(networkMagicNumber));
+}
 
 Edriel::Edriel(asio::io_context& io_ctx)
         : io_context{io_ctx},
@@ -247,16 +313,28 @@ void Edriel::stopAutoDiscovery() {
     stopAutoDiscoverySocketAndTimer();
 }
 
+
+// Topic Registration
+template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+bool Edriel::Edriel::registerPublisherTopic(const std::string& topicName){
+
+}
+template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+bool unregisterPublisherTopic(const std::string& topicName){
+
+}
+template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+bool Edriel::registerSubscriberTopic(const std::string& topicName){
+
+}
+template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+bool Edriel::unregisterSubscriberTopic(const std::string& topicName){
+
+}
+// Message sender (TODO)
+template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+bool Edriel::sendMessage(const std::string& topicName, const Topic& message){
+
+}
+
 Edriel::~Edriel() { stopAutoDiscovery(); }
-
-bool Edriel::hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) const {
-    if (length < magicNumberSize) return false;
-    auto rawBytes = *reinterpret_cast<const std::array<char, magicNumberSize>*>(buffer->data());
-    uint32_t receivedMagicNumber = ntohl(std::bit_cast<uint32_t>(rawBytes));
-    return receivedMagicNumber == magicNumber;
-}
-
-void Edriel::prependMagicNumberToPacket(std::string& packet) const {
-    uint32_t networkMagicNumber = htonl(magicNumber);
-    packet.insert(0, reinterpret_cast<const char*>(&networkMagicNumber), sizeof(networkMagicNumber));
-}

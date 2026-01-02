@@ -14,15 +14,35 @@
 // TODO: unit tests
 // TODO: use concept in cpp20
 // TODO: domain separation
+// TODO: efficient topic exchange
 
 class Edriel {
 public:
+    struct TopicInfo {
+        const std::string topicName;
+        const std::string messageType;
+        const std::string key;
+        TopicInfo(const std::string& topicName_, const std::string& messageType_)
+            : topicName(topicName_), messageType(messageType_), key(topicName_ + messageType_) {}
+        bool operator==(const TopicInfo& other) const {
+            return key == other.key;
+        }
+        bool operator==(const std::string& findKey) const {
+            return key == findKey;
+        }
+        bool operator<(const TopicInfo& other) const {
+            return key < other.key;
+        }
+    };
+
     struct Participant {
             public:
             unsigned long pid;
             uint64_t tid;
             uint64_t uid;
             mutable std::chrono::steady_clock::time_point lastSeen;
+            mutable std::set<TopicInfo> publishedTopics;
+            mutable std::set<TopicInfo> subscribedTopics;
             static constexpr std::chrono::seconds timeoutPeriod{ 10 };
             
             Participant(unsigned long p, uint64_t t, uint64_t u)
@@ -86,6 +106,9 @@ private:
     void handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid);
     void removeTimedOutParticipants();
 
+    // --- Topic Management -------------------------------------------------
+    void handleTopicAnnouncement(unsigned long pid, uint64_t tid, uint64_t uid, const std::string& topicName, const std::string& messageType, bool isPublisher);
+
     // --- Helper Methods -----------------------------------------------------
     bool hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) const;
     void prependMagicNumberToPacket(std::string& packet) const;
@@ -95,7 +118,21 @@ public:
     // Auto-discovery control
     void startAutoDiscovery();
     void stopAutoDiscovery();
-
+    // Message Receiver (TODO)
+    void startMessageReceiver(); // TODO
+    void stopMessageReceiver();  // TODO
+    // Topic Registration
+    template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+    bool registerPublisherTopic(const std::string& topicName);
+    template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+    bool unregisterPublisherTopic(const std::string& topicName);
+    template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+    bool registerSubscriberTopic(const std::string& topicName);
+    template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+    bool unregisterSubscriberTopic(const std::string& topicName);
+    // Message sender (TODO)
+    template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
+    bool sendMessage(const std::string& topicName, const Topic& message);
     ~Edriel();
 };
 

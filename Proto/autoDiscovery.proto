@@ -5,7 +5,7 @@ package autoDiscovery;
 message Message{
   oneof content{
     Identifier identifier = 1;
-    Topic topic = 2;
+    TopicAdvertisement advertisement = 2;
   }
 }
 
@@ -20,4 +20,9 @@ message Topic {
   string message_type = 2; // protobuf message full name
   bool is_publisher = 3; // true if publisher, false if subscriber
   // TODO: QOS policies
+}
+
+message TopicAdvertisement {
+  Identifier identifier = 1;
+  Topic topic = 2;
 }
