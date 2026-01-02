@@ -17,7 +17,7 @@ void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const as
         }
     
         autoDiscovery::Identifier receivedMessage;
-        if(receivedMessage.ParseFromArray(buffer->data() + magicNumberSize, static_cast<int>(bytesTransferred - magicNumberSize))) {
+        if(receivedMessage.ParseFromArray(std::next(buffer->data(), magicNumberSize), static_cast<int>(bytesTransferred - magicNumberSize))) {
             std::cout << "[Recv] PID: " << receivedMessage.pid()
                         << ", TID: " << receivedMessage.tid()
                         << ", UID: " << receivedMessage.uid() << '\n';
