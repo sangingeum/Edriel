@@ -316,11 +316,11 @@ void Edriel::stopAutoDiscovery() {
 
 // Topic Registration
 template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
-bool Edriel::Edriel::registerPublisherTopic(const std::string& topicName){
+bool Edriel::registerPublisherTopic(const std::string& topicName){
 
 }
 template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
-bool unregisterPublisherTopic(const std::string& topicName){
+bool Edriel::unregisterPublisherTopic(const std::string& topicName){
 
 }
 template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
