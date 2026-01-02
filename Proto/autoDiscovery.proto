@@ -1,8 +1,23 @@
 syntax = "proto3";
 
 package autoDiscovery;
+
+message Message{
+  oneof content{
+    Identifier identifier = 1;
+    Topic topic = 2;
+  }
+}
+
 message Identifier {
   uint32 pid = 1;
   uint64 tid = 2;
   uint64 uid = 3;
+}
+
+message Topic {
+  string topic_name = 1; // user-defined topic name
+  string message_type = 2; // protobuf message full name
+  bool is_publisher = 3; // true if publisher, false if subscriber
+  // TODO: QOS policies
 }

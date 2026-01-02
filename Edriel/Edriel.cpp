@@ -1,11 +1,14 @@
 ﻿#include "Edriel.hpp"
 
-bool Edriel::hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) const {
-    if (length < magicNumberSize) return false;
-    auto rawBytes = *reinterpret_cast<const std::array<char, magicNumberSize>*>(buffer->data());
-    uint32_t receivedMagicNumber = ntohl(std::bit_cast<uint32_t>(rawBytes));
-    return receivedMagicNumber == magicNumber;
-}
+#include <string>
+#include <iostream>
+#include <functional>
+#include <array>
+#include <cstddef>
+#include <mutex>
+#include <bit>
+#include <set>
+
 
 void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const asio::error_code& ec, std::size_t bytesTransferred) {
     if (!ec) {
@@ -15,13 +18,29 @@ void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const as
             startAutoDiscoveryReceiver(buffer);  // continue looping
             return;
         }
-    
-        autoDiscovery::Identifier receivedMessage;
+        autoDiscovery::Message receivedMessage;
         if(receivedMessage.ParseFromArray(std::next(buffer->data(), magicNumberSize), static_cast<int>(bytesTransferred - magicNumberSize))) {
-            std::cout << "[Recv] PID: " << receivedMessage.pid()
-                        << ", TID: " << receivedMessage.tid()
-                        << ", UID: " << receivedMessage.uid() << '\n';
-            handleParticipantHeartbeat(receivedMessage.pid(), receivedMessage.tid(), receivedMessage.uid());
+            switch (receivedMessage.content_case())
+            {
+            case autoDiscovery::Message::kIdentifier:{
+                // Handle identifier
+                autoDiscovery::Identifier parsedMessage = receivedMessage.identifier();
+                std::cout << "[Recv] PID: " << parsedMessage.pid()
+                          << ", TID: " << parsedMessage.tid()
+                          << ", UID: " << parsedMessage.uid() << '\n';
+                handleParticipantHeartbeat(parsedMessage.pid(), parsedMessage.tid(), parsedMessage.uid());
+                break;
+            }
+            case autoDiscovery::Message::kTopic:{
+                // Handle topic
+                autoDiscovery::Topic parsedMessage = receivedMessage.topic();
+                std::cout << "[Recv] Topic Name: " << parsedMessage.topic_name()
+                          << ", Message Type: " << parsedMessage.message_type() << '\n';
+                break;
+            }
+            default:
+                break;
+            }
         } else {
             std::cerr << "Failed to parse received message.\n";
         }
@@ -62,9 +81,24 @@ void Edriel::startAutoDiscoverySender() {
     autoDiscoverySendTimer->expires_after(autoDiscoverySendPeriod);
     autoDiscoverySendTimer->async_wait([this](const asio::error_code& ec) {
         if (!ec) {
+            // Send discovery packet to multicast group
             autoDiscoverySocket->async_send_to(
                 asio::buffer(discoveryPacket, discoveryPacket.size()), multicastEndpoint,
                 [](const asio::error_code& ec, std::size_t /*n*/) {
+                    if (ec) std::cerr << "Send failed: " << ec.message() << '\n';
+                });
+            // Send topic packet (TODO)
+            autoDiscovery::Message topicMessage;
+            auto* topic = topicMessage.mutable_topic(); // ensure the oneof is set to topic
+            topic->set_topic_name("example/topic-name"); // example topic name
+            topic->set_message_type("example.MessageType"); // example message type
+            std::shared_ptr<std::string> topicPacket = std::make_shared<std::string>(topicMessage.SerializeAsString());
+            // Attach magic number at the beginning
+            prependMagicNumberToPacket(*topicPacket);
+            // Send topic packet to multicast group
+            autoDiscoverySocket->async_send_to(
+                asio::buffer(*topicPacket, topicPacket->size()), multicastEndpoint,
+                [topicPacket](const asio::error_code& ec, std::size_t /*n*/) {
                     if (ec) std::cerr << "Send failed: " << ec.message() << '\n';
                 });
             startAutoDiscoverySender();  // keep sending
@@ -181,15 +215,14 @@ Edriel::Edriel(asio::io_context& io_ctx)
     thread_local static std::uniform_int_distribution<uint64_t> dist(0, std::numeric_limits<uint64_t>::max());
     std::cout << "Initializing Edriel...\n";
     // Initialize Discovery Packet --------------------------------
-    discoveryMessage.set_pid(static_cast<unsigned long>(::_getpid()));
-    discoveryMessage.set_tid(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-    discoveryMessage.set_uid(dist(generator));
+    auto* identifier = discoveryMessage.mutable_identifier(); // ensure the oneof is set to identifier
+    identifier->set_pid(static_cast<unsigned long>(::_getpid()));
+    identifier->set_tid(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    identifier->set_uid(dist(generator));
     discoveryPacket = discoveryMessage.SerializeAsString();
-    selfParticipant = Participant(discoveryMessage.pid(), discoveryMessage.tid(), discoveryMessage.uid());
+    selfParticipant = Participant(identifier->pid(), identifier->tid(), identifier->uid());
     // Attach magic number at the beginning
-    uint32_t networkMagicNumber = htonl(magicNumber);
-    discoveryPacket.insert(0, reinterpret_cast<const char*>(&networkMagicNumber), sizeof(networkMagicNumber));
-
+    prependMagicNumberToPacket(discoveryPacket);
     std::cout << "Edriel initialized.\n";
 }
 
@@ -216,4 +249,14 @@ void Edriel::stopAutoDiscovery() {
 
 Edriel::~Edriel() { stopAutoDiscovery(); }
 
+bool Edriel::hasValidMagicNumber(std::shared_ptr<Buffer> buffer, std::size_t length) const {
+    if (length < magicNumberSize) return false;
+    auto rawBytes = *reinterpret_cast<const std::array<char, magicNumberSize>*>(buffer->data());
+    uint32_t receivedMagicNumber = ntohl(std::bit_cast<uint32_t>(rawBytes));
+    return receivedMagicNumber == magicNumber;
+}
 
+void Edriel::prependMagicNumberToPacket(std::string& packet) const {
+    uint32_t networkMagicNumber = htonl(magicNumber);
+    packet.insert(0, reinterpret_cast<const char*>(&networkMagicNumber), sizeof(networkMagicNumber));
+}
