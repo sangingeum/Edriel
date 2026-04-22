@@ -81,7 +81,7 @@ private:
     std::unique_ptr<asio::steady_timer> autoDiscoveryCleanUpTimer{};
     asio::ip::udp::endpoint           receiverEndpoint{ asio::ip::address_v4::any(), commonPort };
     asio::ip::udp::endpoint           senderEndpoint{};
-    asio::ip::udp::endpoint           multicastEndpoint{ asio::ip::address_v4::from_string(std::string(multicastAddress)), commonPort };
+    asio::ip::udp::endpoint           multicastEndpoint{ asio::ip::make_address_v4(std::string(multicastAddress)), commonPort };
 
     autoDiscovery::Message discoveryMessage;
     std::string discoveryPacket; // Serialized discoveryMessage with a magic number prepended

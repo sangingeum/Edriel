@@ -8,6 +8,7 @@
 #include <mutex>
 #include <bit>
 #include <set>
+#include <random>
 
 
 void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, const asio::error_code& ec, std::size_t bytesTransferred) {
@@ -180,8 +181,7 @@ void Edriel::initializeAutoDiscovery() {
     // Join multicast group ---------------------------------------------
     try {
         autoDiscoverySocket->set_option(
-            asio::ip::multicast::join_group(
-                asio::ip::address::from_string(std::string(multicastAddress))));
+            asio::ip::multicast::join_group(asio::ip::make_address_v4(std::string(multicastAddress))));
     } catch (const std::exception& e) {
         std::cerr << "Join Group Failed: " << e.what() << '\n';
     }
@@ -282,7 +282,7 @@ Edriel::Edriel(asio::io_context& io_ctx)
     std::cout << "Initializing Edriel...\n";
     // Initialize Discovery Packet --------------------------------
     auto* identifier = discoveryMessage.mutable_identifier(); // ensure the oneof is set to identifier
-    identifier->set_pid(static_cast<unsigned long>(::_getpid()));
+    identifier->set_pid(static_cast<unsigned long>(::getpid()));
     identifier->set_tid(std::hash<std::thread::id>{}(std::this_thread::get_id()));
     identifier->set_uid(dist(generator));
     discoveryPacket = discoveryMessage.SerializeAsString();
@@ -317,24 +317,24 @@ void Edriel::stopAutoDiscovery() {
 // Topic Registration
 template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
 bool Edriel::registerPublisherTopic(const std::string& topicName){
-
+    return true; // TODO
 }
 template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
 bool Edriel::unregisterPublisherTopic(const std::string& topicName){
-
+    return true; // TODO
 }
 template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
 bool Edriel::registerSubscriberTopic(const std::string& topicName){
-
+    return true; // TODO
 }
 template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
 bool Edriel::unregisterSubscriberTopic(const std::string& topicName){
-
+    return true; // TODO
 }
 // Message sender (TODO)
 template<typename Topic> requires std::is_base_of<google::protobuf::Message, Topic>::value
 bool Edriel::sendMessage(const std::string& topicName, const Topic& message){
-
+    return true; // TODO
 }
 
 Edriel::~Edriel() { stopAutoDiscovery(); }

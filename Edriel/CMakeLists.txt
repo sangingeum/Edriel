@@ -1,77 +1,79 @@
-﻿# CMakeList.txt: Edriel에 대한 CMake 프로젝트, 여기에 소스를 포함하고
-# 프로젝트 특정 논리를 정의합니다.
-#
+cmake_minimum_required(VERSION 3.8)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+project(Edriel CXX)
+
+# 1. C++ 표준 설정
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 2. Conan 패키지 로드 (CONFIG REQUIRED 필수)
 find_package(asio CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(asio-grpc CONFIG REQUIRED)
 
-function(grpc_generate_cpp srcs hdrs dest)
-    if(NOT ARGN)
-        message(SEND_ERROR "Error: grpc_generate_cpp() called without any proto files")
-        return()
-    endif()
+# 3. 경로 설정
+set(PROTO_DIR "${CMAKE_SOURCE_DIR}/Proto")
+set(OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 
-    if(NOT TARGET gRPC::grpc_cpp_plugin)
-        message(FATAL_ERROR "gRPC::grpc_cpp_plugin target not found")
-    endif()
-    
-    set(gRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
-
-    get_filename_component(PROTO_ABS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Proto" ABSOLUTE)
-    set(_protobuf_include_path -I "${PROTO_ABS_DIR}")
-
-    set(${srcs})
-    set(${hdrs})
-    foreach(fil ${ARGN})
-        get_filename_component(abs_fil ${fil} ABSOLUTE)
-        get_filename_component(fil_we ${fil} NAME_WE)
-        
-        list(APPEND ${srcs} "${dest}/${fil_we}.grpc.pb.cc")
-        list(APPEND ${hdrs} "${dest}/${fil_we}.grpc.pb.h")
-
-        add_custom_command(
-            OUTPUT "${dest}/${fil_we}.grpc.pb.cc"
-                   "${dest}/${fil_we}.grpc.pb.h"
-            COMMAND protobuf::protoc
-            ARGS --grpc_out=${dest}
-                 --plugin=protoc-gen-grpc=${gRPC_CPP_PLUGIN_EXECUTABLE}
-                 ${_protobuf_include_path}
-                 ${abs_fil}
-            DEPENDS ${abs_fil} protobuf::protoc gRPC::grpc_cpp_plugin
-            COMMENT "Running gRPC C++ protocol buffer compiler on ${fil}"
-            VERBATIM)
-    endforeach()
-
-    set_source_files_properties(${${srcs}} ${${hdrs}} PROPERTIES GENERATED TRUE)
-    set(${srcs} ${${srcs}} PARENT_SCOPE)
-    set(${hdrs} ${${hdrs}} PARENT_SCOPE)
-endfunction()
-
-
-set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Proto")
+# 4. Proto 파일 목록 가져오기
 file(GLOB PROTO_FILES "${PROTO_DIR}/*.proto")
 
-protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
-grpc_generate_cpp(GRPC_SRCS GRPC_HDRS ${CMAKE_CURRENT_BINARY_DIR} ${PROTO_FILES})
+# 생성될 파일들의 목록을 담을 변수 초기화
+set(PROTO_SRCS)
+set(PROTO_HDRS)
+set(GRPC_SRCS)
+set(GRPC_HDRS)
 
-# 이 프로젝트의 실행 파일에 소스를 추가합니다.
-add_executable (Edriel
+# Conan이 제공하는 gRPC 플러그인 실행 파일 경로 가져오기
+set(gRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
+
+# 5. 각 .proto 파일마다 컴파일 명령어 생성
+foreach(PROTO_FILE ${PROTO_FILES})
+    get_filename_component(FIL_WE ${PROTO_FILE} NAME_WE)
+    
+    set(P_CPP "${OUT_DIR}/${FIL_WE}.pb.cc")
+    set(P_HDR "${OUT_DIR}/${FIL_WE}.pb.h")
+    set(G_CPP "${OUT_DIR}/${FIL_WE}.grpc.pb.cc")
+    set(G_HDR "${OUT_DIR}/${FIL_WE}.grpc.pb.h")
+    
+    list(APPEND PROTO_SRCS ${P_CPP})
+    list(APPEND PROTO_HDRS ${P_HDR})
+    list(APPEND GRPC_SRCS ${G_CPP})
+    list(APPEND GRPC_HDRS ${G_HDR})
+
+    # 3. ARGS 내부의 따옴표(") 모두 제거! VERBATIM이 알아서 처리함
+    add_custom_command(
+        OUTPUT ${P_CPP} ${P_HDR} ${G_CPP} ${G_HDR}
+        COMMAND protobuf::protoc
+        ARGS --proto_path=${PROTO_DIR}
+             --cpp_out=${OUT_DIR}
+             --grpc_out=${OUT_DIR}
+             --plugin=protoc-gen-grpc=${gRPC_CPP_PLUGIN_EXECUTABLE}
+             ${PROTO_FILE}
+        DEPENDS ${PROTO_FILE} protobuf::protoc gRPC::grpc_cpp_plugin
+        COMMENT "Compiling ${FIL_WE}.proto to C++ and gRPC..."
+        VERBATIM
+    )
+endforeach()
+
+# 6. 실행 파일 타겟 생성
+add_executable(Edriel
     "main.cpp"
-    "Edriel.cpp" 
-    "Edriel.hpp" 
+    "Edriel.cpp"
+    "Edriel.hpp"
     ${PROTO_SRCS}
     ${PROTO_HDRS}
     ${GRPC_SRCS}
     ${GRPC_HDRS}
 )
 
-target_link_libraries(Edriel PRIVATE protobuf::libprotobuf gRPC::grpc++ gRPC::grpc++_reflection asio-grpc::asio-grpc-standalone-asio asio::asio)
-target_include_directories(Edriel PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+# 7. 라이브러리 링크 및 헤더 경로 추가
+target_link_libraries(Edriel PRIVATE 
+    asio::asio 
+    protobuf::libprotobuf 
+    gRPC::grpc++ 
+    asio-grpc::asio-grpc
+)
 
-
-if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET Edriel PROPERTY CXX_STANDARD 20)
-endif()
-
-# TODO: 필요한 경우 테스트를 추가하고 대상을 설치합니다.
+target_include_directories(Edriel PRIVATE "${OUT_DIR}")
