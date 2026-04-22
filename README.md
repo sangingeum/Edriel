@@ -16,10 +16,8 @@ GCC or MSVC with C++20 support
 `conan install . -of=build --build=missing` (Release) or    
 `conan install . -s build_type=Debug -of=build --build=missing` (Debug)
 3. Run    
-`cmake --list-presets`
-and copy the name of the preset
-4. Run
-`cmake --preset {copied preset name}` 
+`cmake --preset conan-release; cmake --build --preset conan-release` (Linux) or   
+`cmake --preset conan-default; cmake --build --preset conan-default` (Windows)
 
 ## Run
 
