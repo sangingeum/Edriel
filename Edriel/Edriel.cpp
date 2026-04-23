@@ -1,19 +1,13 @@
-﻿/**
+/**
  * @file Edriel.cpp
  * @brief Main implementation file for Edriel C++20 multi-cast auto-discovery networking library
  * 
  * Implements multicast-based auto-discovery with participant lifecycle management,
  * topic-based message publishing/subscribing, and gRPC streaming integration.
- * 
- * @version 2.0.0 - Added timestamp-based replay attack prevention and error codes
  */
 
 #include "Edriel.hpp"
-#include "error_codes.hpp"
 #include <asio/steady_timer.hpp>
-#include <fstream>
-#include <sstream>
-#include <iomanip>
 #include <cstring>
 #include <iostream>
 
@@ -22,14 +16,8 @@ namespace edriel {
 // ============================================================================
 // Configuration Constants
 // ============================================================================
-// TIMESTAMP_VALIDITY_SECONDS is defined in error_codes.hpp
 
-/**
- * @brief Expected magic number for packet integrity
- * 
- * All valid discovery packets must begin with this 4-byte magic number.
- * The magic number serves as a checksum and protocol identifier.
- */
+/// Expected magic number for packet integrity verification
 constexpr uint32_t MAGIC_NUMBER_VALUE = 0xED75E1ED;
 
 // ============================================================================
@@ -41,45 +29,26 @@ constexpr uint32_t MAGIC_NUMBER_VALUE = 0xED75E1ED;
  * 
  * The magic number is the first 4 bytes of every discovery packet.
  * Validates it against our expected magic number 0xED75E1ED.
- * Also checks for replay attacks using timestamp validation.
  * 
  * @param buffer Shared pointer to receive buffer
  * @param length Packet length
- * @param timestamp Current timestamp for replay attack checking
- * @return true if magic number is valid and not a replay attack
+ * @return true if magic number is valid
  */
 bool Edriel::hasValidMagicNumber(std::shared_ptr<Buffer> buffer, 
                                   std::size_t length) const {
-    // Check buffer size for magic number + protobuf message
     if (length < magicNumberSize) {
         std::cout << "[Edriel] Packet too small for magic number validation\n";
-        return false;  // Packet too small
+        return false;
     }
     
-    // Extract magic number from first 4 bytes and convert from network byte order
     uint32_t receivedMagic = ntohl(*reinterpret_cast<const uint32_t*>(buffer->data())); 
     std::cout << "[Edriel] Received magic number: 0x" << std::hex << receivedMagic << std::dec << "\n";
-    // Validate magic number matches expected value
+
     if (receivedMagic != MAGIC_NUMBER_VALUE) {
-        return false;  // Invalid magic number - malformed packet
+        return false;
     }
     
-    return true;  // Valid magic number and timestamp
-}
-
-/**
- * @brief Validates timestamp freshness
- * 
- * Checks that a timestamp is within the acceptable validity window.
- * 
- * @param timestamp Timestamp to validate
- * @return true if timestamp is fresh, false otherwise
- */
-static bool isTimestampFresh(uint64_t timestamp) {
-    uint64_t now = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-    return timestamp >= (now - TIMESTAMP_VALIDITY_SECONDS);
+    return true;
 }
 
 /**

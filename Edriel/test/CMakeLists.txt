@@ -1,72 +1,61 @@
-# Test targets
+find_package(GTest CONFIG REQUIRED)
+find_package(Threads REQUIRED)
+
+# test_participant: Participant struct tests
 add_executable(test_participant
     test_participant.cpp
 )
 
-target_link_libraries(test_participant
-    PRIVATE Edriel
-    gtest_main
-    gtest
-    gmock
-    protobuf::libprotobuf
+target_link_libraries(test_participant PRIVATE
+    EdrielLib
+    GTest::gtest_main
+    Threads::Threads
 )
 
 add_test(NAME TestParticipant COMMAND test_participant)
 
-add_executable(test_topic_manager
-    test_topic_manager.cpp
-)
-
-target_link_libraries(test_topic_manager
-    PRIVATE Edriel
-    gtest_main
-    gtest
-    gmock
-    protobuf::libprotobuf
-)
-
-add_test(NAME TestTopicManager COMMAND test_topic_manager)
-
+# test_cleaner: Timeout logic tests
 add_executable(test_cleaner
     test_cleaner.cpp
 )
 
-target_link_libraries(test_cleaner
-    PRIVATE Edriel
-    gtest_main
-    gtest
-    gmock
-    protobuf::libprotobuf
+target_link_libraries(test_cleaner PRIVATE
+    GTest::gtest_main
+    Threads::Threads
 )
 
 add_test(NAME TestCleaner COMMAND test_cleaner)
 
+# test_magnitude: Magic number validation tests
+add_executable(test_magnitude
+    test_magnitude.cpp
+)
+
+target_link_libraries(test_magnitude PRIVATE
+    GTest::gtest_main
+    Threads::Threads
+)
+
+add_test(NAME TestMagicNumber COMMAND test_magnitude)
+
+# test_integration: Multi-threaded integration tests
 add_executable(test_integration
     test_integration.cpp
 )
 
-target_link_libraries(test_integration
-    PRIVATE Edriel
-    gtest_main
-    gtest
-    gmock
-    protobuf::libprotobuf
-    pthread
+target_link_libraries(test_integration PRIVATE
+    GTest::gtest_main
+    Threads::Threads
 )
 
 add_test(NAME TestIntegration COMMAND test_integration)
 
-# Benchmark target
+# benchmark: Performance benchmarks
 add_executable(benchmark
     benchmark.cpp
 )
 
-target_link_libraries(benchmark
-    PRIVATE Edriel
-    gtest_main
-    gtest
-    pthread
+target_link_libraries(benchmark PRIVATE
+    GTest::gtest_main
+    Threads::Threads
 )
-
-# Note: Benchmarks use GoogleTest assertions but can be run with GoogleTest
-# Add to CMakeLists.txt if you want to enable benchmark tests

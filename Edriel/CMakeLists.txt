@@ -11,13 +11,12 @@ find_package(asio CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(asio-grpc CONFIG REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
 
 # 3. 경로 설정
 set(PROTO_DIR "${CMAKE_SOURCE_DIR}/Proto")
 set(OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 
-# 4. Proto 파일 목록 가져오기
+# 4. Proto 파일 목록
 file(GLOB PROTO_FILES "${PROTO_DIR}/*.proto")
 
 # 생성될 파일들의 목록을 담을 변수 초기화
@@ -43,7 +42,6 @@ foreach(PROTO_FILE ${PROTO_FILES})
     list(APPEND GRPC_SRCS ${G_CPP})
     list(APPEND GRPC_HDRS ${G_HDR})
 
-    # 3. ARGS 내부의 따옴표(") 모두 제거! VERBATIM이 알아서 처리함
     add_custom_command(
         OUTPUT ${P_CPP} ${P_HDR} ${G_CPP} ${G_HDR}
         COMMAND protobuf::protoc
@@ -58,27 +56,36 @@ foreach(PROTO_FILE ${PROTO_FILES})
     )
 endforeach()
 
-# Edriel 소스 파일들 가져오기
-file(GLOB EDRIEL_SRCS "${CMAKE_SOURCE_DIR}/Edriel/*.cpp")
+# 6. Edriel 라이브러리 타겟 (테스트에서도 링크 가능)
+file(GLOB EDRIEL_LIB_SRCS "${CMAKE_SOURCE_DIR}/Edriel/*.cpp")
+list(REMOVE_ITEM EDRIEL_LIB_SRCS "${CMAKE_SOURCE_DIR}/Edriel/main.cpp")
 
-message(${EDRIEL_SRCS})
-
-# 실행 파일 타겟 생성
-add_executable(Edriel
-    ${EDRIEL_SRCS}
+add_library(EdrielLib STATIC
+    ${EDRIEL_LIB_SRCS}
     ${PROTO_SRCS}
     ${PROTO_HDRS}
     ${GRPC_SRCS}
     ${GRPC_HDRS}
 )
 
-# 라이브러리 링크 및 헤더 경로 추가
-target_link_libraries(Edriel PRIVATE 
+target_link_libraries(EdrielLib PUBLIC
     asio::asio 
     protobuf::libprotobuf 
     gRPC::grpc++ 
     asio-grpc::asio-grpc
-    nlohmann_json::nlohmann_json
 )
 
-target_include_directories(Edriel PRIVATE "${OUT_DIR}")
+target_include_directories(EdrielLib PUBLIC
+    "${CMAKE_SOURCE_DIR}/Edriel"
+    "${OUT_DIR}"
+)
+
+# 7. 실행 파일 타겟
+add_executable(Edriel
+    "${CMAKE_SOURCE_DIR}/Edriel/main.cpp"
+)
+
+target_link_libraries(Edriel PRIVATE EdrielLib)
+
+# 8. 테스트 서브디렉토리
+add_subdirectory(test)

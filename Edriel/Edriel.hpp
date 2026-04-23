@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file Edriel.hpp
  * @brief Main header for Edriel C++20 multi-cast auto-discovery networking library
  * 
@@ -16,32 +16,7 @@
 #include "autoDiscovery_grpc_service.pb.h"
 #include <string_view>
 #include <memory>
-#include <unordered_map>
 #include <set>
-
-// ============================================================================
-// C++20 Concepts for Type Constraints
-// ============================================================================
-
-/**
- * @brief Concept for protobuf message types used in topic registration/sending
- */
-template<typename T>
-concept Topic = std::is_base_of_v<google::protobuf::Message, T>;
-
-/**
- * @brief Concept for participant heartbeat messages
- */
-template<typename T>
-concept ParticipantHeartbeat = std::is_same_v<T, autoDiscovery::ParticipantHeartbeat>;
-
-/**
- * @brief Concept for timestamps to prevent replay attacks
- */
-template<typename Clock>
-concept HasTimestamp = requires(Clock c) {
-    { c.now() } -> std::same_as<std::chrono::steady_clock::time_point>;
-};
 
 // ============================================================================
 // Topic Info Structure
@@ -53,6 +28,12 @@ namespace edriel {
  * @brief Magic number constant for packet integrity verification
  */
 constexpr uint32_t MAGIC_NUMBER = 0xED75E1ED;
+
+/**
+ * @brief Concept for protobuf message types used in topic registration/sending
+ */
+template<typename T>
+concept Topic = std::is_base_of_v<google::protobuf::Message, T>;
 
 /**
  * @struct TopicInfo
@@ -194,16 +175,6 @@ private:
     // ========================================================================
     asio::io_context& io_context;        ///< ASIO I/O context
     asio::strand<asio::io_context::executor_type> strand;  ///< Strand for thread-safe async operations
-
-    /**
-     * @brief Gets current timestamp as uint64_t for replay attack checking
-     * @return Current timestamp in seconds since epoch
-     */
-    static uint64_t getCurrentTimestamp() {
-        return static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-    }
     // ========================================================================
     // Sockets and Timers
     // ========================================================================
@@ -211,7 +182,7 @@ private:
     std::unique_ptr<asio::steady_timer> autoDiscoverySendTimer{};  ///< Timer for periodic discovery messages
     std::unique_ptr<asio::steady_timer> autoDiscoveryCleanUpTimer{};  ///< Timer for participant cleanup
     asio::ip::udp::endpoint multicastEndpoint{ asio::ip::make_address_v4(std::string(multicastAddress)), commonPort };  ///< Multicast group endpoint
-    asio::ip::udp::endpoint receiverEndpoint{asio::ip::address_v4::any(), commonPort};  ///< Local endpoint used for sending discovery packets 
+    asio::ip::udp::endpoint receiverEndpoint{asio::ip::address_v4::any(), commonPort};  ///< Local bind endpoint for receiving discovery packets
     
     // ========================================================================
     // Discovery Message Buffer
@@ -223,7 +194,6 @@ private:
     // Control Flags
     // ========================================================================
     std::atomic_bool isRunning{ false };           ///< Main loop running flag
-    std::mutex runnerMutex;                        ///< Mutex for isRunning flag
     
     // ========================================================================
     // Participant Registry
@@ -261,10 +231,6 @@ private:
      */
     void startAutoDiscoveryCleaner();
     
-    /**
-     * @brief Stops socket and timers for graceful shutdown
-     */
-    void stopAutoDiscoverySocketAndTimer();
     
     /**
      * @brief Initializes auto-discovery components

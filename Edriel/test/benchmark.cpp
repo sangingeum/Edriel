@@ -5,7 +5,7 @@
  * This file contains benchmark tests for measuring:
  * - Message throughput (messages per second)
  * - Message latency (end-to-end delay)
- * - Network bandwidth utilization
+ * - Concurrent operation performance
  * - Memory allocation/deallocation performance
  */
 
@@ -15,8 +15,7 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
-#include <queue>
-#include <functional>
+#include <cstring>
 
 namespace edriel {
 
@@ -25,10 +24,8 @@ class ThroughputBenchmark {
 public:
     static uint64_t sendMessage(uint64_t messageCount, size_t messageSize) {
         std::atomic<uint64_t> sentCount{0};
-        std::atomic<uint64_t> receivedCount{0};
         std::mutex mu;
         
-        // Simulate sending messages
         auto startTime = std::chrono::high_resolution_clock::now();
         
         for (uint64_t i = 0; i < messageCount; ++i) {
@@ -41,7 +38,6 @@ public:
             // Simulate sending
             {
                 std::lock_guard<std::mutex> lock(mu);
-                // Simulate async send (non-blocking)
                 sentCount.fetch_add(1, std::memory_order_acq_rel);
             }
             
@@ -49,7 +45,6 @@ public:
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         
-        // Simulate receiving
         auto endTime = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             endTime - startTime
@@ -83,10 +78,10 @@ public:
                 endTime - startTime
             ).count();
             
-            totalLatency.fetch_add(latency);
+            totalLatency.fetch_add(static_cast<uint64_t>(latency));
         }
         
-        EXPECT_GT(totalLatency.load(), 0);
+        EXPECT_GT(totalLatency.load(), 0u);
     }
 };
 
@@ -99,26 +94,20 @@ public:
         const size_t allocCount = 10000;
         const size_t allocSize = 1024;
         
-        std::vector<std::vector<char>> allocations;
+        std::vector<std::unique_ptr<char[]>> allocations;
+        allocations.reserve(allocCount);
         
         for (size_t i = 0; i < allocCount; ++i) {
-            // Allocate
             auto data = std::make_unique<char[]>(allocSize);
             if (data) {
-                for (size_t j = 0; j < allocSize; ++j) {
-                    data[j] = static_cast<char>(i);
-                }
+                std::memset(data.get(), static_cast<int>(i % 256), allocSize);
                 allocations.push_back(std::move(data));
                 totalAllocations.fetch_add(1);
             }
         }
         
         // Deallocate
-        for (auto& data : allocations) {
-            if (data) {
-                data.reset();
-            }
-        }
+        allocations.clear();
         
         EXPECT_EQ(totalAllocations.load(), allocCount);
     }
@@ -129,7 +118,6 @@ class ConcurrentBenchmark {
 public:
     static void testConcurrent() {
         std::atomic<uint64_t> successCount{0};
-        std::atomic<uint64_t> failureCount{0};
         
         const int numThreads = 16;
         const uint64_t opsPerThread = 1000;
@@ -139,9 +127,6 @@ public:
         for (int i = 0; i < numThreads; ++i) {
             threads.emplace_back([&]() {
                 for (uint64_t j = 0; j < opsPerThread; ++j) {
-                    // Simulate concurrent operation
-                    std::atomic<uint64_t> counter{0};
-                    counter.fetch_add(1);
                     successCount.fetch_add(1);
                 }
             });
@@ -155,7 +140,7 @@ public:
     }
 };
 
-// Benchmark: Network bandwidth
+// Benchmark: Network bandwidth (simulated)
 class NetworkBandwidthBenchmark {
 public:
     static uint64_t measureBandwidth(uint64_t messageCount, size_t messageSize) {
@@ -176,7 +161,7 @@ public:
         
         // Calculate bandwidth
         if (duration > 0) {
-            return static_cast<uint64_t>((totalData * 8) / (duration * 1000));  // bps
+            return static_cast<uint64_t>((totalData * 8) / (static_cast<uint64_t>(duration) * 1000));
         }
         
         return 0;
@@ -186,7 +171,7 @@ public:
 // Run all benchmarks
 TEST(Benchmark, MessageThroughput) {
     auto messagesPerSecond = ThroughputBenchmark::sendMessage(10000, 256);
-    EXPECT_GT(messagesPerSecond, 0);
+    EXPECT_GT(messagesPerSecond, 0u);
 }
 
 TEST(Benchmark, MessageLatency) {
@@ -203,7 +188,7 @@ TEST(Benchmark, ConcurrentOperations) {
 
 TEST(Benchmark, NetworkBandwidth) {
     auto bandwidth = NetworkBandwidthBenchmark::measureBandwidth(1000, 512);
-    EXPECT_GE(bandwidth, 0);
+    EXPECT_GE(bandwidth, 0u);
 }
 
 } // namespace edriel
