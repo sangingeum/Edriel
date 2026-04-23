@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package autoDiscovery;
+
+// gRPC service for participant data streaming
+// TODO: Implement bidirectional streaming for heartbeat/presence updates
+
+service ParticipantStreamService {
+  // Server-side streaming: server pushes participant data
+  rpc StreamParticipants (stream ParticipantHeartbeat) 
+      returns (stream ParticipantData);
+  
+  // Unary call for initial connection
+  rpc GetParticipantInfo (ParticipantHeartbeat) 
+      returns (ParticipantData);
+}
+
+message ParticipantHeartbeat {
+  // TODO: Add optional timestamp for replay attack prevention
+  // TODO: Add encryption flag
+  uint32 pid = 1;
+  uint64 tid = 2;
+  uint64 uid = 3;
+  // TODO: Add encryption hash if needed
+}
+
+message ParticipantData {
+  uint32 pid = 1;
+  uint64 tid = 2;
+  uint64 uid = 3;
+  string endpoint = 4;  // gRPC endpoint address
+  string status = 5;  // online/offline/timedout
+  repeated string topics_published = 6;
+  repeated string topics_subscribed = 7;
+  // TODO: Add capability flags (supports streaming, etc.)
+}

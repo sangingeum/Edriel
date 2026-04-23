@@ -1,4 +1,5 @@
 #include "Edriel.hpp"
+#include <iostream>
 
 
 int main()
@@ -10,7 +11,7 @@ int main()
     // Asio test
     asio::io_context io;
     std::cout << "Asio io_context created." << std::endl;
-    Edriel edriel(io);
+    edriel::Edriel edriel(io);
     edriel.startAutoDiscovery();
 	io.run();
     std::cout << "io_context run() has exited." << std::endl;

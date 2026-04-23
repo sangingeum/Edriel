@@ -3,7 +3,8 @@ asio/[*]
 protobuf/[*]
 grpc/[*]
 asio-grpc/[*]
-
+gtest/[*]
+nlohmann_json/[*]
 
 [generators]
 # find_package() 명령어가 .cmake 파일을 찾을 수 있게 해줌
