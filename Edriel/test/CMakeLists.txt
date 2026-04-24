@@ -1,5 +1,4 @@
 find_package(GTest CONFIG REQUIRED)
-find_package(Threads REQUIRED)
 
 # test_participant: Participant struct tests
 add_executable(test_participant
@@ -9,7 +8,6 @@ add_executable(test_participant
 target_link_libraries(test_participant PRIVATE
     EdrielLib
     GTest::gtest_main
-    Threads::Threads
 )
 
 add_test(NAME TestParticipant COMMAND test_participant)
@@ -21,7 +19,6 @@ add_executable(test_cleaner
 
 target_link_libraries(test_cleaner PRIVATE
     GTest::gtest_main
-    Threads::Threads
 )
 
 add_test(NAME TestCleaner COMMAND test_cleaner)
@@ -32,8 +29,8 @@ add_executable(test_magnitude
 )
 
 target_link_libraries(test_magnitude PRIVATE
+    EdrielLib
     GTest::gtest_main
-    Threads::Threads
 )
 
 add_test(NAME TestMagicNumber COMMAND test_magnitude)
@@ -45,7 +42,6 @@ add_executable(test_integration
 
 target_link_libraries(test_integration PRIVATE
     GTest::gtest_main
-    Threads::Threads
 )
 
 add_test(NAME TestIntegration COMMAND test_integration)
@@ -57,5 +53,4 @@ add_executable(benchmark
 
 target_link_libraries(benchmark PRIVATE
     GTest::gtest_main
-    Threads::Threads
 )

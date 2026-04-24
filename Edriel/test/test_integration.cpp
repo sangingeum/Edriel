@@ -88,34 +88,33 @@ TEST(TestIntegration, TimeoutScenario) {
     std::vector<Heartbeat> heartbeats;
     std::mutex hbMu;
     
-    // Thread that adds heartbeats
-    std::thread hbAdder([&]() {
-        for (int i = 0; i < 20; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            Heartbeat hb{
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),
-                true
-            };
-            
-            {
-                std::lock_guard<std::mutex> lock(hbMu);
-                heartbeats.push_back(hb);
-            }
-        }
-    });
-    
-    hbAdder.join();
-    
-    // Simulate timeout cleanup after 500ms
-    auto currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+    uint64_t startTime = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
-    ).count();
+    ).count());
+    // Thread that adds heartbeats
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        Heartbeat hb{
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),
+            true
+        };
+        
+        {
+            std::lock_guard<std::mutex> lock(hbMu);
+            heartbeats.push_back(hb);
+        }
+    }
+     
+    // Simulate timeout cleanup after 500ms
     
+    auto currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
     uint64_t timeoutMs = 500;
-    
     {
         std::lock_guard<std::mutex> lock(hbMu);
         for (auto& hb : heartbeats) {
+            
             uint64_t age = static_cast<uint64_t>(currentTime) - hb.timestamp;
             hb.active = (age <= timeoutMs);
         }
@@ -131,9 +130,11 @@ TEST(TestIntegration, TimeoutScenario) {
             }
         }
     }
-    
+
+    uint64_t exptectedEvictedCount = (currentTime - timeoutMs - startTime) / 50;
+
     // Most heartbeats should still be active (within 500ms timeout)
-    EXPECT_GE(activeCount, 10);  // At least 95% should be active
+    EXPECT_GE(activeCount, 20 - exptectedEvictedCount);  // Allow for some evictions based on timing
 }
 
 // Integration test: Message delivery with multiple subscribers

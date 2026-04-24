@@ -11,6 +11,7 @@ find_package(asio CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(asio-grpc CONFIG REQUIRED)
+find_package(Threads REQUIRED)
 
 # 3. 경로 설정
 set(PROTO_DIR "${CMAKE_SOURCE_DIR}/Proto")
@@ -73,6 +74,7 @@ target_link_libraries(EdrielLib PUBLIC
     protobuf::libprotobuf 
     gRPC::grpc++ 
     asio-grpc::asio-grpc
+    Threads::Threads
 )
 
 target_include_directories(EdrielLib PUBLIC
@@ -85,7 +87,9 @@ add_executable(Edriel
     "${CMAKE_SOURCE_DIR}/Edriel/main.cpp"
 )
 
-target_link_libraries(Edriel PRIVATE EdrielLib)
+target_link_libraries(Edriel PRIVATE 
+    EdrielLib
+)
 
 # 8. 테스트 서브디렉토리
 add_subdirectory(test)
