@@ -11,6 +11,7 @@ find_package(asio CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(asio-grpc CONFIG REQUIRED)
+find_package(yaml-cpp CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 # 3. Proto codegen toolchain ---------------------------------------------------
@@ -125,6 +126,7 @@ target_link_libraries(EdrielLib PUBLIC
     protobuf::libprotobuf
     gRPC::grpc++
     asio-grpc::asio-grpc
+    yaml-cpp::yaml-cpp
     Threads::Threads
 )
 

@@ -1,0 +1,21 @@
+# ============================================================================
+# Edriel runtime configuration
+# ============================================================================
+#
+# Auto-discovery uses UDP multicast. The group address and port are read here
+# at startup and fed into the multicast-send and local-bind endpoints.
+#
+# Both keys are optional. Each value is validated strictly per-key; when a
+# value is missing, malformed, or out of range, the library silently falls
+# back to the built-in default rather than aborting, so a bad or missing
+# config.yml can never crash a node.
+
+# UDP port for auto-discovery multicast send/receive.
+#   - must be an integer in the valid UDP port range 1..65535
+#   - non-numeric, 0, or out-of-range -> falls back to 30002
+port: 30002
+
+# IPv4 multicast group address the node joins for discovery.
+#   - must parse as a valid IPv4 multicast address (first octet 224..239)
+#   - unparseable or non-multicast -> falls back to 239.255.0.1
+multicast_ip: 239.255.0.1

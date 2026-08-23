@@ -15,6 +15,7 @@
 #include "autoDiscovery.pb.h"
 #include "autoDiscovery_grpc_service.pb.h"
 #include <string_view>
+#include <string>
 #include <memory>
 #include <map>
 #include <set>
@@ -22,6 +23,7 @@
 #include <atomic>
 #include <mutex>   // registry synchronization
 #include <tuple>   // std::tie in Participant::operator<
+#include "EdrielConfig.hpp"
 
 // ============================================================================
 // Topic Info Structure
@@ -46,9 +48,9 @@ inline std::string makeCompositeKey(const std::string& topicName,
  */
 constexpr uint32_t MAGIC_NUMBER = 0xED75E1ED;
 
-/**
- * @brief Concept for protobuf message types used in topic registration/sending
- */
+// ============================================================================
+// Concept for protobuf message types used in topic registration/sending
+// ============================================================================
 template<typename T>
 concept Topic = std::is_base_of_v<google::protobuf::Message, T>;
 
@@ -173,8 +175,6 @@ private:
     // ========================================================================
     // Configuration Constants
     // ========================================================================
-    static constexpr uint16_t commonPort{ 30002 };       ///< Multicast port
-    static constexpr std::string_view multicastAddress{ "239.255.0.1" };  ///< Multicast group address
     static constexpr std::size_t recvBufferSize{ 1500 };  ///< UDP receive buffer size
     static constexpr std::chrono::seconds autoDiscoverySendPeriod{ 2 };     ///< Send heartbeat interval
     static constexpr std::chrono::seconds autoDiscoveryCleanUpPeriod{ 5 };  ///< Cleanup interval
@@ -198,8 +198,9 @@ private:
     std::unique_ptr<asio::ip::udp::socket> autoDiscoverySocket{};  ///< UDP socket for multicast
     std::unique_ptr<asio::steady_timer> autoDiscoverySendTimer{};  ///< Timer for periodic discovery messages
     std::unique_ptr<asio::steady_timer> autoDiscoveryCleanUpTimer{};  ///< Timer for participant cleanup
-    asio::ip::udp::endpoint multicastEndpoint{ asio::ip::make_address_v4(std::string(multicastAddress)), commonPort };  ///< Multicast group endpoint
-    asio::ip::udp::endpoint receiverEndpoint{asio::ip::address_v4::any(), commonPort};  ///< Local bind endpoint for receiving discovery packets
+    asio::ip::udp::endpoint multicastEndpoint;       ///< Multicast group endpoint
+    asio::ip::udp::endpoint receiverEndpoint;       ///< Local bind endpoint for receiving discovery packets
+    Config config_;                                  ///< Parsed runtime config (port + multicast group)
     
     // ========================================================================
     // Discovery Message Buffer
@@ -384,7 +385,14 @@ private:
 
 public:
     /**
-     * @brief Constructor
+     * @brief Constructor with explicit runtime configuration
+     * @param io_ctx ASIO I/O context reference
+     * @param config Parsed config (port + multicast group)
+     */
+    Edriel(asio::io_context& io_ctx, const Config& config);
+
+    /**
+     * @brief Constructor using default config values
      * @param io_ctx ASIO I/O context reference
      */
     Edriel(asio::io_context& io_ctx);

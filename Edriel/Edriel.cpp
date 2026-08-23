@@ -11,6 +11,7 @@
 #include <google/protobuf/descriptor.h>
 #include <cstring>
 #include <iostream>
+#include <fstream>
 #include <random>
 
 #if defined(_WIN32)
@@ -90,23 +91,47 @@ void Edriel::prependMagicNumberToPacket(std::string& packet) const {
 // ============================================================================
 
 /**
- * @brief Constructor for Edriel class
- * 
- * Initializes ASIO socket, timers, and other components for auto-discovery.
- * 
+ * @brief Constructor using the config.yml defaults
+ *
+ * Delegates to the config-taking constructor after loading config.yml (or the
+ * built-in defaults when the file is missing or its values are invalid).
+ *
  * @param io_ctx ASIO I/O context reference
  */
 Edriel::Edriel(asio::io_context& io_ctx)
+    : Edriel(io_ctx, loadConfig())
+{}
+
+/**
+ * @brief Constructor for Edriel class
+ *
+ * Initializes ASIO socket, timers, and other components for auto-discovery,
+ * bound to the configured multicast group address and port.
+ *
+ * @param io_ctx ASIO I/O context reference
+ * @param config Parsed runtime config (port + multicast group)
+ */
+Edriel::Edriel(asio::io_context& io_ctx, const Config& config)
     : io_context(io_ctx)
     , strand(asio::make_strand(io_ctx))
     , autoDiscoverySocket(std::make_unique<asio::ip::udp::socket>(io_ctx))
     , autoDiscoverySendTimer(std::make_unique<asio::steady_timer>(io_ctx))
     , autoDiscoveryCleanUpTimer(std::make_unique<asio::steady_timer>(io_ctx))
+    , multicastEndpoint(asio::ip::make_address_v4(config.multicastAddress), config.port)
+    , receiverEndpoint(asio::ip::address_v4::any(), config.port)
+    , config_(config)
 {
+    if (config_.fellBackToDefaults) {
+        std::cout << "[Edriel] One or more invalid config.yml values; "
+                  << "using defaults (port=" << config_.port
+                  << ", multicast=" << config_.multicastAddress << ")\n";
+    }
+
     autoDiscoverySocket->open(receiverEndpoint.protocol());
     // Configure socket for multicast
     autoDiscoverySocket->set_option(asio::ip::udp::socket::reuse_address(true));
-    autoDiscoverySocket->set_option(asio::ip::multicast::join_group(asio::ip::make_address_v4(std::string(multicastAddress))));
+    autoDiscoverySocket->set_option(asio::ip::multicast::join_group(
+                                     asio::ip::make_address_v4(config_.multicastAddress)));
     autoDiscoverySocket->set_option(asio::ip::multicast::enable_loopback(true));
     autoDiscoverySocket->bind(receiverEndpoint);
 
