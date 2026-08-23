@@ -29,8 +29,9 @@ struct Config {
     /// IPv4 multicast group (224.0.0.0 .. 239.255.255.255). Invalid -> "239.255.0.1".
     std::string multicastAddress = "239.255.0.1";
 
-    /// Set true when at least one supplied value was invalid and a default
-    /// substituted (diagnostics only).
+    /// True when one or more config.yml keys were missing or invalid and a
+    /// default was substituted (diagnostics only). Also drives the
+    /// constructor's fallback notice.
     bool fellBackToDefaults = false;
 };
 

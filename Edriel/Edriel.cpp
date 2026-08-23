@@ -122,8 +122,8 @@ Edriel::Edriel(asio::io_context& io_ctx, const Config& config)
     , config_(config)
 {
     if (config_.fellBackToDefaults) {
-        std::cout << "[Edriel] One or more invalid config.yml values; "
-                  << "using defaults (port=" << config_.port
+        std::cout << "[Edriel] One or more config.yml values were missing or "
+                  << "invalid; using defaults (port=" << config_.port
                   << ", multicast=" << config_.multicastAddress << ")\n";
     }
 

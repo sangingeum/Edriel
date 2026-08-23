@@ -80,6 +80,8 @@ TEST(ParseMulticastAddress, RejectsUnparseable) {
     EXPECT_EQ(edriel::parseMulticastAddress("300.0.0.1"), kDefaultMc);  // octet >255
     EXPECT_EQ(edriel::parseMulticastAddress("239.255.0.1.9"), kDefaultMc);  // 5 octets
     EXPECT_EQ(edriel::parseMulticastAddress("239.255.1"), kDefaultMc);  // 3 octets
+    EXPECT_EQ(edriel::parseMulticastAddress("0239.255.0.1"), kDefaultMc);  // leading zero
+    EXPECT_EQ(edriel::parseMulticastAddress("239.255.00.1"), kDefaultMc);  // leading zero
 }
 
 // --- loadConfig ------------------------------------------------------------

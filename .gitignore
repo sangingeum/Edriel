@@ -49,6 +49,8 @@ build_warn
 build_tsan
 build_asan
 build_fresh
+build_pf
+build_pf_gen
 
 # VS
 .vs

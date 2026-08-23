@@ -11,10 +11,11 @@
 
 #include <yaml-cpp/yaml.h>
 
-#include <arpa/inet.h>
 #include <charconv>   // std::from_chars
+#include <cstddef>    // std::size_t
 #include <fstream>    // std::ifstream
 #include <iterator>   // std::istreambuf_iterator
+#include <string_view> // std::string_view
 
 namespace edriel {
 
@@ -34,14 +35,42 @@ uint16_t parsePort(const std::string& value, uint16_t fallback) {
 
 std::string parseMulticastAddress(const std::string& value,
                                   const std::string& fallback) {
-    in_addr addr{};
-    // inet_pton accepts only strict dotted-quad IPv4 (no leading zeros,
-    // no shortcut forms), which is exactly the strictness we want.
-    if (inet_pton(AF_INET, value.c_str(), &addr) != 1) {
-        return fallback;
+    // Parse the dotted-quad IPv4 by hand: inet_pton/ntohl are POSIX-only and
+    // not available on MSVC. Accept exactly four decimal octets, each in
+    // [0, 255] with no leading zeros; the first octet must be in the multicast
+    // range 224..239.
+    std::string_view rest = value;
+    std::uint8_t firstOctet = 0;
+    std::size_t parts = 0;
+    bool hasFirst = false;
+    for (;;) {
+        const std::size_t dot = rest.find('.');
+        const std::string_view octet = rest.substr(0, dot);
+        if (octet.empty() || octet.size() > 3 ||
+            (octet.size() > 1 && octet.front() == '0')) {
+            return fallback;  // empty part, octet > 999, or leading zero
+        }
+        unsigned parsed = 0;
+        const char* const octetBegin = octet.data();
+        const auto [ptr, ec] =
+            std::from_chars(octetBegin, octetBegin + octet.size(), parsed, 10);
+        if (ec != std::errc{} || ptr != (octetBegin + octet.size()) ||
+            parsed > 255) {
+            return fallback;  // non-decimal, trailing junk, or octet > 255
+        }
+        if (!hasFirst) {
+            firstOctet = static_cast<std::uint8_t>(parsed);
+            hasFirst = true;
+        }
+        ++parts;
+        if (dot == std::string_view::npos) {
+            break;
+        }
+        rest = rest.substr(dot + 1);
     }
-    const uint32_t host = ntohl(addr.s_addr);
-    const uint8_t firstOctet = static_cast<uint8_t>((host >> 24) & 0xFF);
+    if (parts != 4) {
+        return fallback;  // fewer or more than four octets
+    }
     if (firstOctet < 224 || firstOctet > 239) {
         return fallback;  // valid IPv4 but not a multicast group
     }
