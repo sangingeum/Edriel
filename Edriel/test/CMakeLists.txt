@@ -81,6 +81,20 @@ target_link_libraries(test_integration PRIVATE
 
 add_test(NAME TestIntegration COMMAND test_integration)
 
+# test_config: config.yml parsing and per-key fallback
+add_executable(test_config
+    test_config.cpp
+)
+
+target_compile_options(test_config PRIVATE ${EDRIEL_STRICT_FLAGS})
+
+target_link_libraries(test_config PRIVATE
+    EdrielLib
+    GTest::gtest_main
+)
+
+add_test(NAME TestConfig COMMAND test_config)
+
 # benchmark: Performance benchmarks
 add_executable(benchmark
     benchmark.cpp
