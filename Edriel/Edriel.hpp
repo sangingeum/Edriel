@@ -20,12 +20,26 @@
 #include <set>
 #include <functional>
 #include <atomic>
+#include <mutex>   // registry synchronization
+#include <tuple>   // std::tie in Participant::operator<
 
 // ============================================================================
 // Topic Info Structure
 // ============================================================================
 
 namespace edriel {
+
+// Separator placed between topic name and message type in a composite
+// registry key so that "ab"+"c" and "a"+"bc" can never collide. A control
+// char (unit separator) is used because it cannot appear in topic names or
+// protobuf type names.
+constexpr char kTopicKeySeparator = static_cast<char>(0x1F);
+
+/// Build the composite registry key for a topic name + message type pair.
+inline std::string makeCompositeKey(const std::string& topicName,
+                                    const std::string& messageType) {
+    return topicName + kTopicKeySeparator + messageType;
+}
 
 /**
  * @brief Magic number constant for packet integrity verification
@@ -59,8 +73,8 @@ public:
          * @param messageType_ Message type
          */
         TopicInfo(const std::string& topicName_, const std::string& messageType_)
-            : topicName(topicName_), messageType(messageType_), 
-              key(topicName_ + messageType_) {}
+            : topicName(topicName_), messageType(messageType_),
+              key(makeCompositeKey(topicName_, messageType_)) {}
         
         /**
          * @brief Equality operator for topic lookups
@@ -229,6 +243,14 @@ private:
     /// Registry keyed by composite key (topicName + messageType)
     std::map<std::string, TopicEntry> topicRegistry;
 
+    /// Guards the strand-shared mutables (`topicRegistry`, `participants`)
+    /// against concurrent access from the public API (any calling thread) and
+    /// the strand-serialized receive/cleaner loop. The public API must keep
+    /// synchronous mutation semantics, so the registry/participant documents
+    /// are protected here; the ASIO socket operations are separately confined
+    /// to the strand (see sendPacket).
+    mutable std::mutex stateMutex;
+
     // ---- Test hooks (unit-test access to internals) ------------------------
   public:
     const std::map<std::string, TopicEntry>& registryForTest() const {
@@ -335,6 +357,12 @@ private:
      */
     bool publishData(const std::string& topicName, const std::string& messageType,
                      const std::string& payload);
+
+    /**
+     * @brief Schedules a function on this object's strand
+     * @param thunk Invoked by the io_context's strand executor
+     */
+    void postOnStrand(std::function<void()> thunk);
 
     
     // ========================================================================
@@ -447,10 +475,14 @@ template<typename T> requires Topic<T>
 bool Edriel::registerPublisherTopic(const std::string& topicName) {
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
 
-    const std::string key = topicInfo.key;
-    TopicEntry& entry = topicRegistry[key];
-    entry.topicName = topicName;
-    entry.messageType = topicInfo.messageType;
+    {
+        // Registry mutation is strand-shared state: guard it so a concurrent
+        // caller thread cannot race the receive/cleaner loop.
+        std::lock_guard<std::mutex> lock(stateMutex);
+        TopicEntry& entry = topicRegistry[topicInfo.key];
+        entry.topicName = topicName;
+        entry.messageType = topicInfo.messageType;
+    }
 
     // Announce our publishing interest via the existing discovery path.
     autoDiscovery::TopicAdvertisement ad;
@@ -477,6 +509,8 @@ bool Edriel::registerPublisherTopic(const std::string& topicName) {
 template<typename T> requires Topic<T>
 bool Edriel::unregisterPublisherTopic(const std::string& topicName) {
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+
+    std::lock_guard<std::mutex> lock(stateMutex);
     const std::string key = topicInfo.key;
 
     auto it = topicRegistry.find(key);
@@ -507,11 +541,13 @@ bool Edriel::unregisterPublisherTopic(const std::string& topicName) {
 template<typename T> requires Topic<T>
 bool Edriel::registerSubscriberTopic(const std::string& topicName) {
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
-    const std::string key = topicInfo.key;
 
-    TopicEntry& entry = topicRegistry[key];
-    entry.topicName = topicName;
-    entry.messageType = topicInfo.messageType;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        TopicEntry& entry = topicRegistry[topicInfo.key];
+        entry.topicName = topicName;
+        entry.messageType = topicInfo.messageType;
+    }
 
     autoDiscovery::TopicAdvertisement ad;
     ad.mutable_identifier()->set_pid(selfParticipant.pid);
@@ -545,18 +581,20 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName,
     }
 
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
-    const std::string key = topicInfo.key;
 
-    TopicEntry& entry = topicRegistry[key];
-    entry.topicName = topicName;
-    entry.messageType = topicInfo.messageType;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        TopicEntry& entry = topicRegistry[topicInfo.key];
+        entry.topicName = topicName;
+        entry.messageType = topicInfo.messageType;
 
-    TopicEntry::Callback erased;
-    erased.messageType = topicInfo.messageType;
-    erased.invoke = [fn = std::move(callback)](const google::protobuf::Message& msg) {
-        fn(dynamic_cast<const T&>(msg));
-    };
-    entry.callbacks.push_back(std::move(erased));
+        TopicEntry::Callback erased;
+        erased.messageType = topicInfo.messageType;
+        erased.invoke = [fn = std::move(callback)](const google::protobuf::Message& msg) {
+            fn(dynamic_cast<const T&>(msg));
+        };
+        entry.callbacks.push_back(std::move(erased));
+    }
 
     std::cout << "[Edriel] Registered subscriber topic with callback: "
               << topicName << "\n";
@@ -584,6 +622,7 @@ bool Edriel::subscribe(const std::string& topicName,
 
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
 
+    std::lock_guard<std::mutex> lock(stateMutex);
     auto it = topicRegistry.find(topicInfo.key);
     if (it == topicRegistry.end()) {
         std::cout << "[Edriel] Subscribe for unregistered topic: "
@@ -612,6 +651,8 @@ bool Edriel::subscribe(const std::string& topicName,
 template<typename T> requires Topic<T>
 bool Edriel::unregisterSubscriberTopic(const std::string& topicName) {
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+
+    std::lock_guard<std::mutex> lock(stateMutex);
     const std::string key = topicInfo.key;
 
     auto it = topicRegistry.find(key);

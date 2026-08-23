@@ -67,8 +67,8 @@ per message.
 ## Core concepts
 
 - **Participant discovery** — `startAutoDiscovery()` joins the multicast group,
-  broadcasts heartbeats every 2 s, and tracks other participants (with a 5 s
-  timeout cleaner).
+  broadcasts heartbeats every 2 s, and drops participants that stop heartbeating
+  for 10 s (the timeout is checked every 5 s).
 - **Topics** — a topic is a name plus a protobuf message type. A publisher and
   a subscriber connect only when both name and type match.
 - **Messages** — any protobuf message type works; you generate its C++ code

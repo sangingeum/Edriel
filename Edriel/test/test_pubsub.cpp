@@ -26,8 +26,8 @@ TEST(TestPubSub, RegisterPublisherCreatesRegistryEntry) {
 
     const auto& registry = edriel.registryForTest();
     EXPECT_EQ(registry.size(), 1u);
-    ASSERT_TRUE(registry.count("sensorautoDiscovery.Topic") == 1);
-    EXPECT_EQ(registry.at("sensorautoDiscovery.Topic").topicName, "sensor");
+    ASSERT_TRUE(registry.count(edriel::makeCompositeKey("sensor", "autoDiscovery.Topic")) == 1);
+    EXPECT_EQ(registry.at(edriel::makeCompositeKey("sensor", "autoDiscovery.Topic")).topicName, "sensor");
 }
 
 TEST(TestPubSub, UnregisterUnknownTopicFails) {
@@ -54,7 +54,8 @@ TEST(TestPubSub, RegisterSubscriberStoresCallback) {
     EXPECT_TRUE(edriel.registerSubscriberTopic<autoDiscovery::Topic>(
         "sensor", [&calls](const autoDiscovery::Topic&) { ++calls; }));
 
-    const auto& entry = edriel.registryForTest().at("sensorautoDiscovery.Topic");
+    const auto& entry = edriel.registryForTest().at(
+        edriel::makeCompositeKey("sensor", "autoDiscovery.Topic"));
     EXPECT_EQ(entry.callbacks.size(), 1u);
 }
 

@@ -49,7 +49,11 @@ bool Edriel::hasValidMagicNumber(std::shared_ptr<Buffer> buffer,
         return false;
     }
     
-    uint32_t receivedMagic = ntohl(*reinterpret_cast<const uint32_t*>(buffer->data()));
+    // Copy to a properly aligned uint32_t rather than reinterpreting the
+    // (possibly unaligned) receive buffer, avoiding UB / strict-aliasing issues.
+    std::uint32_t networkMagic = 0;
+    std::memcpy(&networkMagic, buffer->data(), sizeof(networkMagic));
+    const std::uint32_t receivedMagic = ntohl(networkMagic);
 
     if (receivedMagic != MAGIC_NUMBER_VALUE) {
         return false;
@@ -70,8 +74,10 @@ void Edriel::prependMagicNumberToPacket(std::string& packet) const {
     // Create new buffer with magic number + original packet
     std::string newPacket(magicNumberSize + packet.length(), '\0');
     
-    // Write magic number (first 4 bytes) in network byte order
-    *reinterpret_cast<uint32_t*>(newPacket.data()) = htonl(MAGIC_NUMBER_VALUE);
+    // Write magic number (first 4 bytes) in network byte order. Copied via
+    // memcpy so no aliasing/alignment assumptions are made on the packet.
+    const std::uint32_t networkMagic = htonl(MAGIC_NUMBER_VALUE);
+    std::memcpy(newPacket.data(), &networkMagic, sizeof(networkMagic));
     
     // Copy original packet after magic number
     std::memcpy(newPacket.data() + magicNumberSize, packet.data(), packet.length());
@@ -189,36 +195,49 @@ void Edriel::startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer) {
             }));
 }
 
+void Edriel::postOnStrand(std::function<void()> thunk) {
+    asio::post(strand, std::move(thunk));
+}
+
 /**
  * @brief Starts periodic discovery message sender
  * 
  * Every autoDiscoverySendPeriod seconds (default 2s), sends a discovery
  * heartbeat packet containing our participant information to the multicast group.
+ * 
+ * The whole send-rearm cycle runs on the strand so the shared socket and the
+ * reusable discoveryPacket member are never touched concurrently from another
+ * thread (e.g. a sendPacket posted by the public API).
  */
 void Edriel::startAutoDiscoverySender() {
-    // Serialize discovery message
-    discoveryMessage.SerializeToString(&discoveryPacket);
-    prependMagicNumberToPacket(discoveryPacket);
-    
-    // Set up async send operation
-    autoDiscoverySocket->async_send_to(
-        asio::buffer(discoveryPacket),
-        multicastEndpoint,
-        [this](const asio::error_code& ec, std::size_t /*bytesTransferred*/) {
-            if (ec) {
-                std::cerr << "[Edriel] Discovery send failed: "
-                          << ec.message() << "\n";
-            }
+    postOnStrand([this] {
+        // Serialize discovery message
+        discoveryMessage.SerializeToString(&discoveryPacket);
+        prependMagicNumberToPacket(discoveryPacket);
 
-            // Schedule next send
-            autoDiscoverySendTimer->expires_after(autoDiscoverySendPeriod);
-            autoDiscoverySendTimer->async_wait(
-                [this](const asio::error_code& ec) {
-                    if (!ec) {
-                        startAutoDiscoverySender();
+        // Set up async send operation
+        autoDiscoverySocket->async_send_to(
+            asio::buffer(discoveryPacket),
+            multicastEndpoint,
+            asio::bind_executor(strand,
+                [this](const asio::error_code& ec,
+                       std::size_t /*bytesTransferred*/) {
+                    if (ec) {
+                        std::cerr << "[Edriel] Discovery send failed: "
+                                  << ec.message() << "\n";
                     }
-                });
-        });
+
+                    // Schedule next send
+                    autoDiscoverySendTimer->expires_after(autoDiscoverySendPeriod);
+                    autoDiscoverySendTimer->async_wait(
+                        asio::bind_executor(strand,
+                            [this](const asio::error_code& ec) {
+                                if (!ec) {
+                                    startAutoDiscoverySender();
+                                }
+                            }));
+                }));
+    });
 }
 
 /**
@@ -228,15 +247,18 @@ void Edriel::startAutoDiscoverySender() {
  * have timed out and removes them from the registry.
  */
 void Edriel::startAutoDiscoveryCleaner() {
-    removeTimedOutParticipants();  // Initial cleanup
-    
-    autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanUpPeriod);
-    autoDiscoveryCleanUpTimer->async_wait(
-        [this](const asio::error_code& ec) {
-            if (!ec) {
-                startAutoDiscoveryCleaner();  // Reschedule
-            }
-        });
+    postOnStrand([this] {
+        removeTimedOutParticipants();  // Initial cleanup
+
+        autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanUpPeriod);
+        autoDiscoveryCleanUpTimer->async_wait(
+            asio::bind_executor(strand,
+                [this](const asio::error_code& ec) {
+                    if (!ec) {
+                        startAutoDiscoveryCleaner();  // Reschedule
+                    }
+                }));
+    });
 }
 
 // ============================================================================
@@ -309,6 +331,15 @@ void Edriel::handleAutoDiscoveryParse(const autoDiscovery::Message& receivedMess
  * @param uid Unique identifier
  */
 void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid) {
+    // Multicast loopback is enabled, so the node receives its own discovery
+    // packets every send period. Never register ourselves: the uid is a
+    // process-unique random token, so skipping it is a reliable self-filter.
+    if (uid == selfParticipant.uid) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(stateMutex);
+
     // Check if participant already exists
     auto it = std::find_if(
         participants.begin(),
@@ -325,10 +356,6 @@ void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_
         newParticipant.lastSeen = std::chrono::steady_clock::now();
         
         participants.insert(newParticipant);
-        
-        // Log new participant
-        // std::cout << "[Edriel] New participant discovered: pid=" 
-        //           << pid << ", tid=" << tid << ", uid=" << uid << "\n";
     } else {
         // Existing participant, update timestamp
         it->updateLastSeen();
@@ -342,19 +369,40 @@ void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_
  * period has elapsed since the last heartbeat.
  */
 void Edriel::removeTimedOutParticipants() {
+    std::lock_guard<std::mutex> lock(stateMutex);
+
     // Find participants to remove
     auto it = participants.begin();
     while (it != participants.end()) {
         if (it->shouldBeRemoved()) {
+            const Participant stale = *it;
+
+            // Stale topic purge: drop this participant from every registry
+            // entry so a peer that times out no longer appears as a publisher
+            // or subscriber of any topic.
+            for (auto& kv : topicRegistry) {
+                TopicEntry& entry = kv.second;
+                entry.publishers.erase(stale);
+                entry.subscribers.erase(stale);
+            }
+
             // Remove and advance
             it = participants.erase(it);
         } else {
             ++it;
         }
     }
-    
-    // Log cleanup
-    // std::cout << "[Edriel] Cleaned up timed-out participants\n";
+
+    // Drop registry entries left with no local callbacks and no remote peers.
+    for (auto entry = topicRegistry.begin(); entry != topicRegistry.end(); ) {
+        if (entry->second.publishers.empty()
+            && entry->second.subscribers.empty()
+            && entry->second.callbacks.empty()) {
+            entry = topicRegistry.erase(entry);
+        } else {
+            ++entry;
+        }
+    }
 }
 
 /**
@@ -376,9 +424,17 @@ void Edriel::handleTopicAnnouncement(unsigned long pid,
                                      const std::string& messageType,
                                      bool isPublisher) {
 
+    // Loopback delivers our own topic advertisements back to us; never record
+    // ourselves as a peer publisher/subscriber in the registry.
+    if (uid == selfParticipant.uid) {
+        return;
+    }
+
     TopicInfo topicInfo(topicName, messageType);
 
     Participant remote(pid, tid, uid);
+
+    std::lock_guard<std::mutex> lock(stateMutex);
     TopicEntry& entry = topicRegistry[topicInfo.key];
 
     entry.topicName = topicName;
@@ -407,17 +463,26 @@ void Edriel::handleTopicAnnouncement(unsigned long pid,
  * @param data Parsed DataMessage from the wire
  */
 void Edriel::handleDataMessageReceive(const autoDiscovery::DataMessage& data) {
-    const std::string key = data.topic_name() + data.message_type();
-    auto it = topicRegistry.find(key);
-    if (it == topicRegistry.end()) {
-        return;  // No local subscription for this topic
+    const std::string key = makeCompositeKey(data.topic_name(), data.message_type());
+
+    // Collect the matching callbacks under the lock, then invoke them after
+    // releasing it so user code (a callback) may safely re-enter the public API.
+    std::vector<TopicEntry::Callback> matched;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        auto it = topicRegistry.find(key);
+        if (it == topicRegistry.end()) {
+            return;  // No local subscription for this topic
+        }
+        for (const auto& cb : it->second.callbacks) {
+            if (cb.invoke && cb.messageType == data.message_type()) {
+                matched.push_back(cb);
+            }
+        }
     }
 
     const google::protobuf::Message* prototype = nullptr;
-    for (const auto& cb : it->second.callbacks) {
-        if (!cb.invoke || cb.messageType != data.message_type()) {
-            continue;
-        }
+    for (auto& cb : matched) {
         if (prototype == nullptr) {
             // Resolve the payload prototype once per message, not once per
             // callback — the generated-pool lookup is a hot-path cost.
@@ -468,16 +533,26 @@ bool Edriel::sendPacket(const google::protobuf::Message& message) {
         return false;
     }
 
+    // The socket is shared with the strand-confined discovery sender/receiver,
+    // so the actual async_send_to is initiated on the strand. Serialization and
+    // the MTU check above happen synchronously on the calling thread (they only
+    // touch the local message), so a non-strand thread can safely publish. The
+    // buffer is copied and kept alive by the strand task so no member data is
+    // aliased across the send.
     auto sharedPacket = std::make_shared<std::string>(std::move(packet));
-    autoDiscoverySocket->async_send_to(
-        asio::buffer(sharedPacket->data(), sharedPacket->size()),
-        multicastEndpoint,
-        [this, sharedPacket](const asio::error_code& ec, std::size_t /*bytesTransferred*/) {
-            if (ec) {
-                std::cerr << "[Edriel] Failed to send packet: "
-                          << ec.message() << "\n";
-            }
-        });
+    postOnStrand([this, sharedPacket] {
+        autoDiscoverySocket->async_send_to(
+            asio::buffer(sharedPacket->data(), sharedPacket->size()),
+            multicastEndpoint,
+            asio::bind_executor(strand,
+                [this, sharedPacket](const asio::error_code& ec,
+                                     std::size_t /*bytesTransferred*/) {
+                    if (ec) {
+                        std::cerr << "[Edriel] Failed to send packet: "
+                                  << ec.message() << "\n";
+                    }
+                }));
+    });
     return true;
 }
 
