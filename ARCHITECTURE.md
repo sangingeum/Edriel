@@ -44,11 +44,16 @@ Handles multicast-based participant auto-discovery:
 - Receive discovery packets from other participants
 - Parse and extract participant information
 - Manage multicast socket lifecycle
+- Bind/join the multicast group using the resolved (configured) port and address
 
 **Key Methods:**
 - `sendDiscoveryPacket()`: Serialize and broadcast discovery message
 - `receiveDiscoveryPacket()`: Listen for incoming packets
 - `parseHeartbeat()`: Extract participant metadata
+
+The multicast group it binds to is not hardcoded: the endpoint is derived from
+the runtime `Config` (see §6), which itself is populated from `config.yml`
+(`port` / `multicast_ip`) with a fallback to defaults when invalid.
 
 ### 2. Topic Management Module (`modules/topic_manager.hpp`)
 
@@ -133,7 +138,7 @@ Broadcasts messages to multicast group:
 
 **Flow:**
 1. Serialize message with magic number prepended
-2. Set multicast destination (239.255.0.1)
+2. Set multicast destination (config-derived port/multicast address)
 3. Async send via ASIO
 4. Notify topic subscribers
 
@@ -143,14 +148,38 @@ template<typename Topic> requires Topic
 bool sendMessage(const std::string& topicName, const Topic& message);
 ```
 
+### 6. Configuration Module (`EdrielConfig.hpp` / `EdrielConfig.cpp`)
+
+Loads and validates the runtime endpoint settings that previously were
+hardcoded (port `30002`, multicast group `239.255.0.1`):
+
+**Responsibilities:**
+- Parse `config.yml` via yaml-cpp (`port` and `multicast_ip` keys)
+- Validate each key independently and strictly
+- Fall back to a key's historical default on any missing/invalid/unparseable value
+- Report (via `fellBackToDefaults`) when a default was substituted, for diagnostics
+- Keep parsing in its own translation unit so validation is testable without an `io_context`
+
+**Key Methods:**
+- `parsePort(value, fallback)`: strict decimal integer in `[1, 65535]`, else `fallback`
+- `parseMulticastAddress(value, fallback)`: strict dotted-quad IPv4 in `224.0.0.0..239.255.255.255`, else `fallback`
+- `loadConfig(configPath = "config.yml")`: returns a `Config`; never throws on config content
+
+**Fallback Behavior:** each key is resolved independently — missing, malformed,
+or out-of-range values keep that key's default (`port` → `30002`,
+`multicastAddress` → `239.255.0.1`), and the `fellBackToDefaults` flag is set.
+The default `Edriel` constructor calls `loadConfig()`; the resolved values drive
+`multicastEndpoint` / `receiverEndpoint` and the multicast `join_group` call.
+
 ## Data Flow
 
 ### Discovery Flow
 ```
+0. Load config.yml and validate (per-key), falling back to defaults on invalid
 1. Timer fires (every 2s)
 2. Create discovery message with own participant info
 3. Serialize to packet + prepend magic number
-4. Broadcast to multicast address
+4. Broadcast to multicast address (config-derived)
 5. Wait for responses
 6. Parse responses and register new participants
 7. Update participant heartbeats
@@ -221,7 +250,9 @@ Edriel Instance
 ├── std::unique_ptr<udp::socket> autoDiscoverySocket
 ├── std::unique_ptr<steady_timer> autoDiscoverySendTimer
 ├── std::unique_ptr<steady_timer> autoDiscoveryCleanUpTimer
-├── asio::ip::udp::endpoint multicastEndpoint
+├── asio::ip::udp::endpoint multicastEndpoint  // config-derived (multicastAddress:port)
+├── asio::ip::udp::endpoint receiverEndpoint   // config-derived (any:port)
+├── edriel::Config config_                     // parsed runtime config (port + multicast group)
 ├── autoDiscovery::Message discoveryMessage
 ├── std::string discoveryPacket
 ├── std::atomic_bool isRunning
@@ -273,6 +304,5 @@ Edriel Instance
 - Topic compression
 
 ### Configuration
-- YAML/JSON config file support
-- Dynamic port/timeout configuration
 - Multi-network interface support
+- Live config reload without restart (config is currently read once at construction)
