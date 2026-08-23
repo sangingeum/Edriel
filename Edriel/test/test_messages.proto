@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+// Payload type used by the Edriel latency/throughput benchmarks.
+package bench;
+
+message Ping {
+  int64 seq = 1;
+  bytes blob = 2;
+}

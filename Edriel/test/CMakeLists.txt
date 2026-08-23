@@ -1,9 +1,38 @@
+include("${CMAKE_SOURCE_DIR}/cmake/EdrielProtoMessages.cmake")
+
+# Payload types used by test_pubsub and the benchmarks.
+edriel_add_proto_messages(test_messages
+    SRCS test_messages.proto
+    PROTO_PATH ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 find_package(GTest CONFIG REQUIRED)
+
+# House warn bar for project-owned test targets (strict, local to this dir so
+# user code that re-includes EdrielLib is unaffected).
+set(EDRIEL_STRICT_FLAGS -Wall -Wextra -Wpedantic -Werror)
+
+# test_pubsub: Topic registry / pub-sub data path tests
+add_executable(test_pubsub
+    test_pubsub.cpp
+)
+
+target_compile_options(test_pubsub PRIVATE ${EDRIEL_STRICT_FLAGS})
+
+target_link_libraries(test_pubsub PRIVATE
+    EdrielLib
+    test_messages
+    GTest::gtest_main
+)
+
+add_test(NAME TestPubSub COMMAND test_pubsub)
 
 # test_participant: Participant struct tests
 add_executable(test_participant
     test_participant.cpp
 )
+
+target_compile_options(test_participant PRIVATE ${EDRIEL_STRICT_FLAGS})
 
 target_link_libraries(test_participant PRIVATE
     EdrielLib
@@ -17,6 +46,8 @@ add_executable(test_cleaner
     test_cleaner.cpp
 )
 
+target_compile_options(test_cleaner PRIVATE ${EDRIEL_STRICT_FLAGS})
+
 target_link_libraries(test_cleaner PRIVATE
     GTest::gtest_main
 )
@@ -27,6 +58,8 @@ add_test(NAME TestCleaner COMMAND test_cleaner)
 add_executable(test_magnitude
     test_magnitude.cpp
 )
+
+target_compile_options(test_magnitude PRIVATE ${EDRIEL_STRICT_FLAGS})
 
 target_link_libraries(test_magnitude PRIVATE
     EdrielLib
@@ -40,6 +73,8 @@ add_executable(test_integration
     test_integration.cpp
 )
 
+target_compile_options(test_integration PRIVATE ${EDRIEL_STRICT_FLAGS})
+
 target_link_libraries(test_integration PRIVATE
     GTest::gtest_main
 )
@@ -51,6 +86,15 @@ add_executable(benchmark
     benchmark.cpp
 )
 
+target_compile_options(benchmark PRIVATE ${EDRIEL_STRICT_FLAGS})
+
 target_link_libraries(benchmark PRIVATE
+    EdrielLib
+    EdrielTestMessages
     GTest::gtest_main
+)
+
+# benchmark.cpp includes protobuf headers generated into Edriel's binary dir.
+target_include_directories(benchmark PRIVATE
+    "${CMAKE_BINARY_DIR}"
 )

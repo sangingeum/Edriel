@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package benchmark;
+
+// Minimal payload used by test/benchmark.cpp to measure publish -> callback
+// round-trip latency and throughput over multicast loopback.
+message Ping {
+  uint64 seq = 1;    // sender-assigned sequence number
+  bytes blob = 2;    // optional padding to reach target payload size
+}
