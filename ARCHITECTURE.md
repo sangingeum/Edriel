@@ -182,8 +182,8 @@ Server:  Send final status on close
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `commonPort` | 30002 | Multicast port |
-| `multicastAddress` | 239.255.0.1 | Multicast group address |
+| `discoveryPort` (config.yml `port`) | 30002 | Multicast port — overridable, falls back on invalid |
+| `multicastAddress` (config.yml `multicast_ip`) | 239.255.0.1 | Multicast group address — overridable, falls back on invalid |
 | `recvBufferSize` | 1500 | UDP buffer size |
 | `autoDiscoverySendPeriod` | 2s | Discovery heartbeat interval |
 | `autoDiscoveryCleanUpPeriod` | 5s | Cleanup timer interval |

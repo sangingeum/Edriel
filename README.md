@@ -43,6 +43,42 @@ Run benchmarks (latency + throughput over multicast loopback):
 ./build/Release/Edriel/test/benchmark
 ```
 
+## Configuration (`config.yml`)
+
+The auto-discovery endpoint — the UDP port and the multicast group address —
+is read from a `config.yml` at the repository root (the process working
+directory). Both keys are optional; every value is validated strictly per-key,
+and a value that is missing, malformed, or out of range falls back silently to
+the built-in default rather than failing startup.
+
+```yaml
+port: 30002
+multicast_ip: 239.255.0.1
+```
+
+| Key | Valid range | Falls back to |
+|-----|-------------|---------------|
+| `port` | integer in `1..65535` | `30002` |
+| `multicast_ip` | IPv4 multicast `224.0.0.0` .. `239.255.255.255` | `239.255.0.1` |
+
+A missing, unreadable, or malformed `config.yml` behaves exactly like an
+invalid value: the defaults are used and no exception escapes. Because
+validation is per-key, a valid `port` is honored even when `multicast_ip` is
+bad (and vice-versa). YAML is parsed with yaml-cpp (added to the Conan
+dependencies).
+
+The library constructor reads the file automatically:
+
+```cpp
+asio::io_context io;
+edriel::Edriel edriel(io);              // loads config.yml (or the defaults)
+edriel::Edriel edrielCfg(io, config);   // explicit edriel::Config
+```
+
+`edriel::Config` has `port`, `multicastAddress`, and a diagnostic
+`fellBackToDefaults` flag. The explicit-constructor overload lets a host
+application supply validated settings without a config file being present.
+
 ## Benchmark baseline
 
 Measured with `Edriel/test/benchmark.cpp` on Ubuntu 24.04, g++ 13.3, Release
