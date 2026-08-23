@@ -6,7 +6,21 @@ message Message{
   oneof content{
     Identifier identifier = 1;
     TopicAdvertisement advertisement = 2;
+    DataMessage data_message = 3;
   }
+}
+
+// User payload wrapped for multicast transport.
+// MTU note: the receiver reads at most 1500 bytes (one classic Ethernet frame)
+// per datagram; anything beyond that is silently truncated by UDP datagram
+// semantics. Senders MUST keep (magic header + serialized DataMessage) within
+// that budget; Edriel rejects larger payloads at send time rather than
+// delivering truncated data.
+message DataMessage {
+  Identifier identifier = 1;   // sender identity (heartbeat piggyback)
+  string topic_name = 2;       // user-defined topic name
+  string message_type = 3;     // protobuf full name of the payload type
+  bytes payload = 4;           // serialized user message
 }
 
 message Identifier {

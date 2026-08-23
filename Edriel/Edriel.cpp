@@ -8,8 +8,16 @@
 
 #include "Edriel.hpp"
 #include <asio/steady_timer.hpp>
+#include <google/protobuf/descriptor.h>
 #include <cstring>
 #include <iostream>
+#include <random>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace edriel {
 
@@ -41,8 +49,7 @@ bool Edriel::hasValidMagicNumber(std::shared_ptr<Buffer> buffer,
         return false;
     }
     
-    uint32_t receivedMagic = ntohl(*reinterpret_cast<const uint32_t*>(buffer->data())); 
-    std::cout << "[Edriel] Received magic number: 0x" << std::hex << receivedMagic << std::dec << "\n";
+    uint32_t receivedMagic = ntohl(*reinterpret_cast<const uint32_t*>(buffer->data()));
 
     if (receivedMagic != MAGIC_NUMBER_VALUE) {
         return false;
@@ -97,10 +104,14 @@ Edriel::Edriel(asio::io_context& io_ctx)
     autoDiscoverySocket->set_option(asio::ip::multicast::enable_loopback(true));
     autoDiscoverySocket->bind(receiverEndpoint);
 
-    // Initialize self participant
-    selfParticipant.pid = 0;
+    // Initialize self participant: real pid + a process-unique uid so two
+    // nodes never collapse into the same registry identity.
+    static std::random_device rd;
+    const auto selfPid = static_cast<unsigned long>(::getpid());
+    selfParticipant.pid = selfPid;
     selfParticipant.tid = 0;
-    selfParticipant.uid = 0;
+    selfParticipant.uid = (static_cast<uint64_t>(rd()) << 32)
+                        | static_cast<uint64_t>(rd());
     selfParticipant.lastSeen = std::chrono::steady_clock::now();
 
     // Initialize discovery message template
@@ -154,26 +165,28 @@ void Edriel::startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer) {
     if (!buffer) {
         buffer = std::make_shared<Buffer>();
     }
-    
+
+    // Registry mutations are serialized on this object's strand so concurrent
+    // completions (multi-threaded io_context) cannot race the std::set/map.
     autoDiscoverySocket->async_receive(
         asio::buffer(buffer->data(), recvBufferSize),
-        [this, buffer](const asio::error_code& ec, std::size_t bytesTransferred) {
-            if (!ec && bytesTransferred > 0) {
-                // Extract timestamp from magic number location for replay check
-                 std::cout << "[Edriel] Received packet of size " << bytesTransferred << " bytes\n";
-                // Validate magic number
-                if (hasValidMagicNumber(buffer, bytesTransferred)) {        
-                    // Parse discovery message
-                    handleAutoDiscoveryReceive(buffer, ec, bytesTransferred);
-                } else {
-                    std::cerr << "[Edriel] Received invalid or replayed packet, ignoring\n";
-                    // std::cerr << "[Edriel] Invalid packet rejected\n";
+        asio::bind_executor(strand,
+            [this, buffer](const asio::error_code& ec, std::size_t bytesTransferred) {
+                if (!ec && bytesTransferred > 0) {
+                    if (hasValidMagicNumber(buffer, bytesTransferred)) {
+                        handleAutoDiscoveryReceive(buffer, ec, bytesTransferred);
+                    }
                 }
-            }
-            
-            // Keep listening
-            startAutoDiscoveryReceiver(buffer);
-        });
+
+                // Keep listening. On abort (socket closed during shutdown) or
+                // a closed socket the re-arm would spin the io_context forever
+                // (bad-fd completes immediately), so stop instead.
+                if (ec == asio::error::operation_aborted || !isRunning
+                    || !autoDiscoverySocket->is_open()) {
+                    return;
+                }
+                startAutoDiscoveryReceiver(buffer);
+            }));
 }
 
 /**
@@ -192,14 +205,11 @@ void Edriel::startAutoDiscoverySender() {
         asio::buffer(discoveryPacket),
         multicastEndpoint,
         [this](const asio::error_code& ec, std::size_t /*bytesTransferred*/) {
-            if (!ec) {
-                std::cout << "[Edriel] Sent discovery packet to [" 
-                          << multicastAddress << ":" << commonPort << "] from [" << autoDiscoverySocket->local_endpoint() << "]\n";
-            } else {
-                std::cerr << "[Edriel] Failed to send discovery packet: " 
+            if (ec) {
+                std::cerr << "[Edriel] Discovery send failed: "
                           << ec.message() << "\n";
             }
-            
+
             // Schedule next send
             autoDiscoverySendTimer->expires_after(autoDiscoverySendPeriod);
             autoDiscoverySendTimer->async_wait(
@@ -255,29 +265,31 @@ void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer,
     if (!receivedMessage.ParseFromArray(buffer->data() + magicNumberSize, 
                                         bytesTransferred - magicNumberSize)) {
         // Failed to parse protobuf message
-        // std::cerr << "[Edriel] Failed to parse discovery message\n";
         return;
     }
-    std::cout << "[Edriel] Received valid discovery packet\n";
-    
+    handleAutoDiscoveryParse(receivedMessage);
+}
+
+/**
+ * @brief Dispatches a parsed discovery message by content type (oneof)
+ *
+ * @param receivedMessage Parsed protobuf message
+ */
+void Edriel::handleAutoDiscoveryParse(const autoDiscovery::Message& receivedMessage) {
     // Handle based on message content type (oneof)
     if (receivedMessage.has_identifier()) {
-        
+
         const auto& id = receivedMessage.identifier();
-        std::cout << "[Edriel] Received heartbeat from pid=" << id.pid() 
-                  << ", tid=" << id.tid() 
-                  << ", uid=" << id.uid() << "\n";    
         handleParticipantHeartbeat(id.pid(), id.tid(), id.uid());
+    } else if (receivedMessage.has_data_message()) {
+        const auto& data = receivedMessage.data_message();
+        const auto& id = data.identifier();
+        handleParticipantHeartbeat(id.pid(), id.tid(), id.uid());
+        handleDataMessageReceive(data);
     } else if (receivedMessage.has_advertisement()) {
         const auto& ad = receivedMessage.advertisement();
         const auto& id = ad.identifier();
         const auto& topic = ad.topic();
-         std::cout << "[Edriel] Received topic announcement from pid=" << id.pid() 
-                  << ", tid=" << id.tid() 
-                  << ", uid=" << id.uid() 
-                  << " for topic=" << topic.topic_name() 
-                  << ", type=" << topic.message_type() 
-                  << ", isPublisher=" << topic.is_publisher() << "\n";
         handleParticipantHeartbeat(id.pid(), id.tid(), id.uid());
         handleTopicAnnouncement(
             id.pid(), id.tid(), id.uid(),
@@ -330,8 +342,6 @@ void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_
  * period has elapsed since the last heartbeat.
  */
 void Edriel::removeTimedOutParticipants() {
-    auto now = std::chrono::steady_clock::now();
-    
     // Find participants to remove
     auto it = participants.begin();
     while (it != participants.end()) {
@@ -359,23 +369,137 @@ void Edriel::removeTimedOutParticipants() {
  * @param messageType Message type
  * @param isPublisher Whether announcing as publisher
  */
-void Edriel::handleTopicAnnouncement(unsigned long pid, uint64_t tid, uint64_t uid, 
-                                     const std::string& topicName, 
-                                     const std::string& messageType, bool isPublisher) {
-    
+void Edriel::handleTopicAnnouncement(unsigned long pid,
+                                     uint64_t tid,
+                                     uint64_t uid,
+                                     const std::string& topicName,
+                                     const std::string& messageType,
+                                     bool isPublisher) {
+
     TopicInfo topicInfo(topicName, messageType);
-    auto topicKey = topicInfo.key;
-    
-    // TODO: Implement topic registry management
-    // - Track which participants publish/subscribe to each topic
-    // - Notify subscribers when message is sent
-    // - Handle topic lifecycle
-    
-    // Placeholder: just log
-    // std::cout << "[Edriel] Topic announcement: topic=" << topicName 
-    //           << ", type=" << messageType 
-    //           << ", isPublisher=" << isPublisher 
-    //           << ", from pid=" << pid << "\n";
+
+    Participant remote(pid, tid, uid);
+    TopicEntry& entry = topicRegistry[topicInfo.key];
+
+    entry.topicName = topicName;
+    entry.messageType = messageType;
+
+    if (isPublisher) {
+        entry.publishers.insert(remote);
+    } else {
+        entry.subscribers.insert(remote);
+    }
+
+    // Drop registry entries with no remaining local interest and no remote peers.
+    if (entry.publishers.empty() && entry.subscribers.empty()
+        && entry.callbacks.empty()) {
+        topicRegistry.erase(topicInfo.key);
+    }
+}
+
+/**
+ * @brief Handles a received data message
+ *
+ * Demuxes by composite key (topic name + message type) and invokes all
+ * locally registered typed subscriber callbacks for the topic whose declared
+ * message type matches. Callbacks run on this object's strand.
+ *
+ * @param data Parsed DataMessage from the wire
+ */
+void Edriel::handleDataMessageReceive(const autoDiscovery::DataMessage& data) {
+    const std::string key = data.topic_name() + data.message_type();
+    auto it = topicRegistry.find(key);
+    if (it == topicRegistry.end()) {
+        return;  // No local subscription for this topic
+    }
+
+    const google::protobuf::Message* prototype = nullptr;
+    for (const auto& cb : it->second.callbacks) {
+        if (!cb.invoke || cb.messageType != data.message_type()) {
+            continue;
+        }
+        if (prototype == nullptr) {
+            // Resolve the payload prototype once per message, not once per
+            // callback — the generated-pool lookup is a hot-path cost.
+            const google::protobuf::Descriptor* descriptor =
+                google::protobuf::DescriptorPool::generated_pool()->
+                    FindMessageTypeByName(data.message_type());
+            if (descriptor == nullptr) {
+                std::cerr << "[Edriel] Unknown payload type: "
+                          << data.message_type() << "\n";
+                return;
+            }
+            prototype =
+                google::protobuf::MessageFactory::generated_factory()->GetPrototype(descriptor);
+        }
+        std::unique_ptr<google::protobuf::Message> decoded(prototype->New());
+        if (!decoded->ParseFromString(data.payload())) {
+            std::cerr << "[Edriel] Failed to decode payload for topic "
+                      << data.topic_name() << "\n";
+            continue;
+        }
+        cb.invoke(*decoded);
+    }
+}
+
+/**
+ * @brief Prepends magic number and multicasts a serialized protobuf message
+ *
+ * MTU note: the receive path reads at most recvBufferSize (1500) bytes per
+ * datagram — one classic Ethernet frame without VLAN tagging. UDP datagrams
+ * larger than the socket buffer are truncated silently, so any outgoing
+ * packet exceeding the budget is rejected here rather than sent.
+ *
+ * @param message Protobuf message to send
+ * @return true if the send was dispatched successfully
+ */
+bool Edriel::sendPacket(const google::protobuf::Message& message) {
+    std::string packet;
+    if (!message.SerializeToString(&packet)) {
+        std::cerr << "[Edriel] Failed to serialize outgoing message\n";
+        return false;
+    }
+    prependMagicNumberToPacket(packet);
+
+    if (packet.size() > recvBufferSize) {
+        std::cerr << "[Edriel] Outgoing packet of " << packet.size()
+                  << " bytes exceeds " << recvBufferSize
+                  << "-byte MTU budget, dropping\n";
+        return false;
+    }
+
+    auto sharedPacket = std::make_shared<std::string>(std::move(packet));
+    autoDiscoverySocket->async_send_to(
+        asio::buffer(sharedPacket->data(), sharedPacket->size()),
+        multicastEndpoint,
+        [this, sharedPacket](const asio::error_code& ec, std::size_t /*bytesTransferred*/) {
+            if (ec) {
+                std::cerr << "[Edriel] Failed to send packet: "
+                          << ec.message() << "\n";
+            }
+        });
+    return true;
+}
+
+/**
+ * @brief Serializes and multicasts a DataMessage envelope
+ *
+ * @param topicName Topic name to publish under
+ * @param messageType Protobuf full name of payload type
+ * @param payload Serialized user message bytes
+ * @return true if sending succeeded
+ */
+bool Edriel::publishData(const std::string& topicName, const std::string& messageType,
+                         const std::string& payload) {
+    autoDiscovery::Message envelope;
+    autoDiscovery::DataMessage* data = envelope.mutable_data_message();
+    data->mutable_identifier()->set_pid(selfParticipant.pid);
+    data->mutable_identifier()->set_tid(selfParticipant.tid);
+    data->mutable_identifier()->set_uid(selfParticipant.uid);
+    data->set_topic_name(topicName);
+    data->set_message_type(messageType);
+    data->set_payload(payload);
+    return sendPacket(envelope);
 }
 
 // ============================================================================
@@ -422,122 +546,10 @@ void Edriel::stopAutoDiscovery() {
 // ============================================================================
 // Public API: Topic Registration (C++20 templates)
 // ============================================================================
-
-/**
- * @brief Registers a topic for publishing
- * 
- * Adds a topic to the internal registry for this participant to publish to.
- * 
- * @tparam T Protobuf message type (constrained by Topic concept)
- * @param topicName Topic name to register
- * @return true if registration succeeded
- */
-template<typename T> requires Topic<T>
-bool Edriel::registerPublisherTopic(const std::string& topicName) {
-    TopicInfo topicInfo(topicName, "publisher");
-    
-    // TODO: Implement topic registry storage
-    // - Store topic name in topicInfo for subscriber lookups
-    // - Track publishing participants per topic
-    
-    // Placeholder: return success
-    std::cout << "[Edriel] Registered publisher topic: " << topicName << "\n";
-    return true;
-}
-
-/**
- * @brief Unregisters a topic for publishing
- * 
- * Removes a topic from the internal publishing registry.
- * 
- * @tparam T Protobuf message type (constrained by Topic concept)
- * @param topicName Topic name to unregister
- * @return true if unregistration succeeded
- */
-template<typename T> requires Topic<T>
-bool Edriel::unregisterPublisherTopic(const std::string& topicName) {
-    TopicInfo topicInfo(topicName, "publisher");
-    
-    // TODO: Implement topic registry cleanup
-    
-    // Placeholder
-    std::cout << "[Edriel] Unregistered publisher topic: " << topicName << "\n";
-    return true;
-}
-
-/**
- * @brief Registers a topic for subscribing
- * 
- * Adds a topic to the internal registry for this participant to subscribe to.
- * 
- * @tparam T Protobuf message type (constrained by Topic concept)
- * @param topicName Topic name to register
- * @return true if registration succeeded
- */
-template<typename T> requires Topic<T>
-bool Edriel::registerSubscriberTopic(const std::string& topicName) {
-    TopicInfo topicInfo(topicName, "subscriber");
-    
-    // TODO: Implement subscriber registry storage
-    
-    // Placeholder
-    std::cout << "[Edriel] Registered subscriber topic: " << topicName << "\n";
-    return true;
-}
-
-/**
- * @brief Unregisters a topic for subscribing
- * 
- * Removes a topic from the internal subscriber registry.
- * 
- * @tparam T Protobuf message type (constrained by Topic concept)
- * @param topicName Topic name to unregister
- * @return true if unregistration succeeded
- */
-template<typename T> requires Topic<T>
-bool Edriel::unregisterSubscriberTopic(const std::string& topicName) {
-    TopicInfo topicInfo(topicName, "subscriber");
-    
-    // TODO: Implement subscriber registry cleanup
-    
-    // Placeholder
-    std::cout << "[Edriel] Unregistered subscriber topic: " << topicName << "\n";
-    return true;
-}
-
-// ============================================================================
-// Public API: Message Sending
-// ============================================================================
-
-/**
- * @brief Sends a message to a topic via multicast broadcast
- * 
- * Serializes the message, prepends magic number, and broadcasts to multicast
- * group. All participants subscribed to the topic will receive this message.
- * 
- * @tparam T Protobuf message type (constrained by Topic concept)
- * @param topicName Topic to send to
- * @param message Message instance to serialize and broadcast
- * @return true if sending succeeded
- */
-template<typename T> requires Topic<T>
-bool Edriel::sendMessage(const std::string& topicName, const T& message) {
-    // TODO: Implement message serialization
-    // - Serialize Topic message to protobuf
-    // - Prepend magic number
-    // - Send to multicast socket
-    
-    // Placeholder
-    std::cout << "[Edriel] Sending message to topic: " << topicName << "\n";
-    return true;
-}
-
-// Explicit template instantiations for common protobuf types
-// These ensure template functions are available in translation units
-// that don't define their own templates
-
-// Example explicit instantiations would go here if needed
-// template bool Edriel::sendMessage<std::string>(const std::string&, const std::string&);
-// template bool Edriel::sendMessage<google::protobuf::Message>(const std::string&, const google::protobuf::Message&);
+// The topic-registration and send APIs are templates parameterized on the
+// user's protobuf message type; their definitions appear at the end of this
+// header so they are visible at every instantiation site — including types
+// generated from user .proto files via edriel_add_proto_messages(). No
+// explicit instantiations are needed.
 
 }  // namespace edriel

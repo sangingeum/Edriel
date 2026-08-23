@@ -16,7 +16,10 @@
 #include "autoDiscovery_grpc_service.pb.h"
 #include <string_view>
 #include <memory>
+#include <map>
 #include <set>
+#include <functional>
+#include <atomic>
 
 // ============================================================================
 // Topic Info Structure
@@ -202,6 +205,41 @@ private:
     Participant selfParticipant{0, 0, 0};           ///< Placeholder for self
     
     // ========================================================================
+    // Topic Registry
+    // ========================================================================
+    /**
+     * @struct TopicEntry
+     * @brief Per-topic registry entry: local subscriber callbacks plus
+     *        remote participants seen publishing/subscribing to the topic.
+     */
+    struct TopicEntry {
+        std::string topicName;      ///< Base topic name
+        std::string messageType;    ///< Protobuf message type name
+        std::set<Participant> publishers;    ///< Remote participants publishing this topic
+        std::set<Participant> subscribers;   ///< Remote participants subscribing to this topic
+        /// Local typed callbacks invoked on matching received data messages.
+        /// Stored type-erased; each carries its own expected message type name.
+        struct Callback {
+            std::string messageType;
+            std::function<void(const google::protobuf::Message&)> invoke;
+        };
+        std::vector<Callback> callbacks;
+    };
+
+    /// Registry keyed by composite key (topicName + messageType)
+    std::map<std::string, TopicEntry> topicRegistry;
+
+    // ---- Test hooks (unit-test access to internals) ------------------------
+  public:
+    const std::map<std::string, TopicEntry>& registryForTest() const {
+        return topicRegistry;
+    }
+    void deliverForTest(const autoDiscovery::Message& msg) {
+        handleAutoDiscoveryParse(msg);
+    }
+
+  private:
+    // ========================================================================
     // Internal Methods
     // ========================================================================
     
@@ -211,9 +249,15 @@ private:
      * @param ec ASIO error code
      * @param bytesTransferred Number of bytes received
      */
-    void handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, 
-                                     const asio::error_code& ec, 
+    void handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer,
+                                     const asio::error_code& ec,
                                      std::size_t bytesTransferred);
+
+    /**
+     * @brief Dispatches a parsed discovery message by content type (oneof)
+     * @param receivedMessage Parsed protobuf message
+     */
+    void handleAutoDiscoveryParse(const autoDiscovery::Message& receivedMessage);
     
     /**
      * @brief Starts the auto-discovery receiver loop
@@ -265,9 +309,33 @@ private:
      * @param messageType Message type
      * @param isPublisher Whether announcing as publisher
      */
-    void handleTopicAnnouncement(unsigned long pid, uint64_t tid, uint64_t uid, 
-                                 const std::string& topicName, 
+    void handleTopicAnnouncement(unsigned long pid, uint64_t tid, uint64_t uid,
+                                 const std::string& topicName,
                                  const std::string& messageType, bool isPublisher);
+
+    /**
+     * @brief Handles a received data message (demux by topic, invoke callbacks)
+     * @param data Parsed DataMessage from the wire
+     */
+    void handleDataMessageReceive(const autoDiscovery::DataMessage& data);
+
+    /**
+     * @brief Prepends magic number and multicasts a serialized protobuf message
+     * @param message Protobuf message to send
+     * @return true if the send was dispatched successfully
+     */
+    bool sendPacket(const google::protobuf::Message& message);
+
+    /**
+     * @brief Serializes and multicasts a DataMessage envelope
+     * @param topicName Topic name to publish under
+     * @param messageType Protobuf full name of payload type
+     * @param payload Serialized user message bytes
+     * @return true if sending succeeded
+     */
+    bool publishData(const std::string& topicName, const std::string& messageType,
+                     const std::string& payload);
+
     
     // ========================================================================
     // Helper Methods
@@ -310,61 +378,43 @@ public:
      * @brief Stops auto-discovery and cleans up resources
      */
     void stopAutoDiscovery();
-    
+
     // ========================================================================
     // Public API: Topic Registration (C++20 templates)
+    // Declarations only; template definitions are at the end of this header.
     // ========================================================================
-    /**
-     * @brief Registers a topic for publishing
-     * @tparam Topic Protobuf message type
-     * @param topicName Topic name to register
-     * @return true if registration succeeded
-     */
     template<typename T> requires Topic<T>
     bool registerPublisherTopic(const std::string& topicName);
-    
-    /**
-     * @brief Unregisters a topic for publishing
-     * @tparam Topic Protobuf message type
-     * @param topicName Topic name to unregister
-     * @return true if unregistration succeeded
-     */
+
     template<typename T> requires Topic<T>
     bool unregisterPublisherTopic(const std::string& topicName);
-    
-    /**
-     * @brief Registers a topic for subscribing
-     * @tparam Topic Protobuf message type
-     * @param topicName Topic name to register
-     * @return true if registration succeeded
-     */
+
     template<typename T> requires Topic<T>
     bool registerSubscriberTopic(const std::string& topicName);
-    
+
+    template<typename T> requires Topic<T>
+    bool registerSubscriberTopic(const std::string& topicName,
+                                 std::function<void(const T&)> callback);
+
     /**
-     * @brief Unregisters a topic for subscribing
-     * @tparam Topic Protobuf message type
-     * @param topicName Topic name to unregister
-     * @return true if unregistration succeeded
+     * @brief Subscribes with a typed callback to an already-registered topic
+     * @param topicName Topic name previously registered for subscription
+     * @param callback Invoked with each received message of type T
+     * @return true if the callback was attached
      */
+    template<typename T> requires Topic<T>
+    bool subscribe(const std::string& topicName,
+                   std::function<void(const T&)> callback);
+
     template<typename T> requires Topic<T>
     bool unregisterSubscriberTopic(const std::string& topicName);
-    
+
     // ========================================================================
-    // Public API: Message Sending
+    // Public API: Message Sending (C++20 templates)
     // ========================================================================
-    /**
-     * @brief Sends a message to a topic via multicast broadcast
-     * @tparam Topic Protobuf message type
-     * @param topicName Topic to send to
-     * @param message Message instance to serialize and broadcast
-     * @return true if sending succeeded
-     */
     template<typename T> requires Topic<T>
     bool sendMessage(const std::string& topicName, const T& message);
-    
-    // ========================================================================
-    // Future: gRPC Streaming Support
+
     // ========================================================================
     /**
      * @brief Stream participant heartbeat data to gRPC client
@@ -374,8 +424,239 @@ public:
     // void streamParticipants(grpc::ServerContext* context,
     //                         const google::protobuf::RepeatedPtrField<autoDiscovery::ParticipantHeartbeat>& initialHeartbeats,
     //                         grpc::ServerWriter<autoDiscovery::ParticipantData>* response_writer);
-    
-};
+};  // class Edriel
+
+
+// ============================================================================
+// Public API: Topic Registration / Message Sending (template definitions)
+// Defined as out-of-class member templates so they are visible at every
+// instantiation site — including types generated from user .proto files via
+// edriel_add_proto_messages(). No explicit instantiations are needed.
+// ============================================================================
+
+/**
+ * @brief Registers a topic for publishing
+ *
+ * Adds a topic to the internal registry for this participant to publish to.
+ *
+ * @tparam T Protobuf message type (constrained by Topic concept)
+ * @param topicName Topic name to register
+ * @return true if registration succeeded
+ */
+template<typename T> requires Topic<T>
+bool Edriel::registerPublisherTopic(const std::string& topicName) {
+    TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+
+    const std::string key = topicInfo.key;
+    TopicEntry& entry = topicRegistry[key];
+    entry.topicName = topicName;
+    entry.messageType = topicInfo.messageType;
+
+    // Announce our publishing interest via the existing discovery path.
+    autoDiscovery::TopicAdvertisement ad;
+    ad.mutable_identifier()->set_pid(selfParticipant.pid);
+    ad.mutable_identifier()->set_tid(selfParticipant.tid);
+    ad.mutable_identifier()->set_uid(selfParticipant.uid);
+    ad.mutable_topic()->set_topic_name(topicName);
+    ad.mutable_topic()->set_message_type(topicInfo.messageType);
+    ad.mutable_topic()->set_is_publisher(true);
+
+    std::cout << "[Edriel] Registered publisher topic: " << topicName << "\n";
+    return sendPacket(ad);
+}
+
+/**
+ * @brief Unregisters a topic for publishing
+ *
+ * Removes a topic from the internal publishing registry.
+ *
+ * @tparam T Protobuf message type (constrained by Topic concept)
+ * @param topicName Topic name to unregister
+ * @return true if unregistration succeeded
+ */
+template<typename T> requires Topic<T>
+bool Edriel::unregisterPublisherTopic(const std::string& topicName) {
+    TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+    const std::string key = topicInfo.key;
+
+    auto it = topicRegistry.find(key);
+    if (it == topicRegistry.end()) {
+        std::cout << "[Edriel] Unregister for unknown topic: " << topicName << "\n";
+        return false;
+    }
+
+    // No local publisher-side state beyond the entry itself; drop the entry
+    // if no local callbacks remain, otherwise keep it for the subscriber side.
+    if (it->second.callbacks.empty()) {
+        topicRegistry.erase(it);
+    }
+
+    std::cout << "[Edriel] Unregistered publisher topic: " << topicName << "\n";
+    return true;
+}
+
+/**
+ * @brief Registers a topic for subscribing
+ *
+ * Adds a topic to the internal registry for this participant to subscribe to.
+ *
+ * @tparam T Protobuf message type (constrained by Topic concept)
+ * @param topicName Topic name to register
+ * @return true if registration succeeded
+ */
+template<typename T> requires Topic<T>
+bool Edriel::registerSubscriberTopic(const std::string& topicName) {
+    TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+    const std::string key = topicInfo.key;
+
+    TopicEntry& entry = topicRegistry[key];
+    entry.topicName = topicName;
+    entry.messageType = topicInfo.messageType;
+
+    autoDiscovery::TopicAdvertisement ad;
+    ad.mutable_identifier()->set_pid(selfParticipant.pid);
+    ad.mutable_identifier()->set_tid(selfParticipant.tid);
+    ad.mutable_identifier()->set_uid(selfParticipant.uid);
+    ad.mutable_topic()->set_topic_name(topicName);
+    ad.mutable_topic()->set_message_type(topicInfo.messageType);
+    ad.mutable_topic()->set_is_publisher(false);
+
+    std::cout << "[Edriel] Registered subscriber topic: " << topicName << "\n";
+    return sendPacket(ad);
+}
+
+/**
+ * @brief Registers a topic for subscribing with a typed callback
+ *
+ * Stores the type-erased callback under the composite key and announces the
+ * subscription via a TopicAdvertisement discovery packet. Callbacks are
+ * invoked on this object's strand when matching data messages arrive.
+ *
+ * @tparam T Protobuf message type (constrained by Topic concept)
+ * @param topicName Topic name to register
+ * @param callback Invoked with each received message of type T
+ * @return true if registration succeeded
+ */
+template<typename T> requires Topic<T>
+bool Edriel::registerSubscriberTopic(const std::string& topicName,
+                                     std::function<void(const T&)> callback) {
+    if (!callback) {
+        return false;
+    }
+
+    TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+    const std::string key = topicInfo.key;
+
+    TopicEntry& entry = topicRegistry[key];
+    entry.topicName = topicName;
+    entry.messageType = topicInfo.messageType;
+
+    TopicEntry::Callback erased;
+    erased.messageType = topicInfo.messageType;
+    erased.invoke = [fn = std::move(callback)](const google::protobuf::Message& msg) {
+        fn(dynamic_cast<const T&>(msg));
+    };
+    entry.callbacks.push_back(std::move(erased));
+
+    std::cout << "[Edriel] Registered subscriber topic with callback: "
+              << topicName << "\n";
+    return registerSubscriberTopic<T>(topicName);
+}
+
+/**
+ * @brief Subscribes to an already-registered topic with a typed callback
+ *
+ * Attaches the type-erased callback to the existing registry entry for
+ * topicName (with T's message type) without re-announcing the subscription
+ * on the wire. Use after registerSubscriberTopic(topicName).
+ *
+ * @tparam T Protobuf message type (constrained by Topic concept)
+ * @param topicName Topic name to attach the callback to
+ * @param callback Invoked with each received message of type T
+ * @return true if the callback was attached successfully
+ */
+template<typename T> requires Topic<T>
+bool Edriel::subscribe(const std::string& topicName,
+                       std::function<void(const T&)> callback) {
+    if (!callback) {
+        return false;
+    }
+
+    TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+
+    auto it = topicRegistry.find(topicInfo.key);
+    if (it == topicRegistry.end()) {
+        std::cout << "[Edriel] Subscribe for unregistered topic: "
+                  << topicName << "\n";
+        return false;
+    }
+
+    TopicEntry::Callback erased;
+    erased.messageType = topicInfo.messageType;
+    erased.invoke = [fn = std::move(callback)](const google::protobuf::Message& msg) {
+        fn(dynamic_cast<const T&>(msg));
+    };
+    it->second.callbacks.push_back(std::move(erased));
+    return true;
+}
+
+/**
+ * @brief Unregisters a topic for subscribing
+ *
+ * Removes a topic from the internal subscriber registry.
+ *
+ * @tparam T Protobuf message type (constrained by Topic concept)
+ * @param topicName Topic name to unregister
+ * @return true if unregistration succeeded
+ */
+template<typename T> requires Topic<T>
+bool Edriel::unregisterSubscriberTopic(const std::string& topicName) {
+    TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+    const std::string key = topicInfo.key;
+
+    auto it = topicRegistry.find(key);
+    if (it == topicRegistry.end()) {
+        std::cout << "[Edriel] Unregister for unknown topic: " << topicName << "\n";
+        return false;
+    }
+
+    // Remove all local callbacks for this topic; keep the entry only if it
+    // still tracks remote peers (registry bookkeeping for discovery).
+    it->second.callbacks.clear();
+    if (it->second.publishers.empty() && it->second.subscribers.empty()) {
+        topicRegistry.erase(it);
+    }
+
+    std::cout << "[Edriel] Unregistered subscriber topic: " << topicName << "\n";
+    return true;
+}
+
+// ============================================================================
+// Public API: Message Sending
+// ============================================================================
+
+/**
+ * @brief Sends a message to a topic via multicast broadcast
+ *
+ * Serializes the message into a DataMessage envelope, prepends the magic
+ * number, and multicasts it. All participants subscribed to the topic will
+ * receive this message.
+ *
+ * @tparam T Protobuf message type (constrained by Topic concept)
+ * @param topicName Topic to send to
+ * @param message Message instance to serialize and broadcast
+ * @return true if sending succeeded
+ */
+template<typename T> requires Topic<T>
+bool Edriel::sendMessage(const std::string& topicName, const T& message) {
+    std::string payload;
+    if (!message.SerializeToString(&payload)) {
+        std::cerr << "[Edriel] Failed to serialize message for topic: "
+                  << topicName << "\n";
+        return false;
+    }
+    return publishData(topicName, std::string(T::descriptor()->full_name()), payload);
+}
 
 } // namespace edriel
 
