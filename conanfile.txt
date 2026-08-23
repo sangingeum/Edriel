@@ -1,8 +1,8 @@
 [requires]
-asio/[*]
-protobuf/[*]
-grpc/[*]
-asio-grpc/[*]
+asio/[~1.38]
+protobuf/6.33.5
+grpc/[~1.83]
+asio-grpc/[>=2 <4]
 gtest/1.17.0
 
 [generators]

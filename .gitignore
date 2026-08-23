@@ -43,6 +43,14 @@
 # build outputs
 out
 build
+build_setup
+build_strict
+build_warn
+build_tsan
+build_asan
+build_fresh
 
 # VS
 .vs
+# CMake / Conan user-local files (ignored: per-machine, not part of the repo)
+CMakeUserPresets.json
