@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+// Sample user-defined message for the Edriel examples.
+package robot;
+
+message Telemetry {
+  uint32 node_id = 1;
+  double battery_voltage = 2;
+  double wheel_rpm = 3;
+}
+
+message Command {
+  uint32 target_node_id = 1;
+  double linear_velocity = 2;
+  double angular_velocity = 3;
+}
