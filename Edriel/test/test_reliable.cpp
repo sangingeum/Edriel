@@ -201,10 +201,11 @@ TEST(Reliable, RoundTripPublisherToSubscriber) {
 }
 
 TEST(Reliable, ReorderDedupExactlyOnce) {
-    // ISSUE #3: an EMPTY reorder window fast-forwards to a tid past nextExpected
-    // (accepted one-time catch-up for a late-joining subscriber) instead of
-    // buffering it forever. Within the fast-forwarded/in-order stream, duplicates
-    // are still dropped and contiguous frames delivered exactly-once in order.
+    // A GENUINE in-flight reorder arriving at an EMPTY window must be buffered
+    // and delivered exactly-once in tid order — NOT fast-forwarded past the
+    // hole (which would silently drop frame 1). A within-bound gap — one with
+    // (tid - nextExpected) < kReliableWindowSize — is always consistent with
+    // ordinary reordering and is held, even when the window is empty (ADR-0001).
     asio::io_context io;
     Edriel sub(io);
 
@@ -218,24 +219,29 @@ TEST(Reliable, ReorderDedupExactlyOnce) {
         },
         true));
 
-    // Late catch-up: tid 3 hits an empty window (nextExpected=1) -> fast-forward
-    // and deliver; a subsequent duplicate is dropped; in-order frames deliver.
-    sub.handleReliableDataFrame(makeReliableFrame(3, "three"));  // fast-forward
-    sub.handleReliableDataFrame(makeReliableFrame(3, "three"));  // duplicate -> drop
-    sub.handleReliableDataFrame(makeReliableFrame(4, "four"));   // in-order
-    sub.handleReliableDataFrame(makeReliableFrame(5, "five"));   // in-order
-    sub.handleReliableDataFrame(makeReliableFrame(2, "two"));    // stale (tid<next) -> drop
+    // In-order 1 is still en route; 3 and 2 arrive first (within the bound).
+    // The window must buffer them and deliver 1,2,3 in order, exactly-once.
+    sub.handleReliableDataFrame(makeReliableFrame(3, "three"));
+    sub.handleReliableDataFrame(makeReliableFrame(2, "two"));
+    sub.handleReliableDataFrame(makeReliableFrame(1, "one"));
+    // A late duplicate of an already-delivered frame must be dropped
+    // (exactly-once) and must not disturb the ordering.
+    sub.handleReliableDataFrame(makeReliableFrame(2, "two"));
 
-    std::vector<std::string> expected{"three", "four", "five"};
+    std::vector<std::string> expected{"one", "two", "three"};
     std::lock_guard<std::mutex> lock(mu);
     EXPECT_EQ(delivered, expected);
 }
 
 TEST(Reliable, LateJoinerReceivesCurrentFrames) {
-    // ISSUE #3 regression: a subscriber that joins after the publisher's
-    // per-(publisher,topic) tid has already advanced (late joiner) must start
-    // receiving current frames immediately — the first tid past nextExpected on
-    // an empty window fast-forwards the cursor instead of buffering forever.
+    // ISSUE #3 regression (kept): a subscriber that joins after the publisher's
+    // per-(publisher,topic) tid has already moved PAST the bounded window (a gap
+    // >= kReliableWindowSize) cannot see those earlier tids in flight — no NAK/
+    // replay layer exists — so a FRESH/EMPTY window fast-forwards nextExpected
+    // to the incoming tid and delivers current frames immediately, instead of
+    // buffering/starving on a gap that will never fill. The large-gap
+    // fast-forward must fire ONLY on an empty window (a >= window gap on a
+    // mid-stream non-empty window remains a genuine unrecoverable drop).
     asio::io_context io;
     Edriel sub(io);
 
@@ -249,16 +255,17 @@ TEST(Reliable, LateJoinerReceivesCurrentFrames) {
         },
         true));
 
-    // A publisher already at tid 100: the late joiner (nextExpected=1) must
-    // fast-forward and deliver 100,101,102 rather than hold on empty gaps.
+    // The publisher is already at tid 300, more than a full window (256) past
+    // the late joiner's nextExpected=1: (300-1) >= kReliableWindowSize, so the
+    // fresh empty window fast-forwards and delivers 300,301,302 in order.
     for (const auto& [tid, v] : std::vector<std::pair<std::uint64_t, std::string>>{
-             {100, "hundred"}, {101, "hundred-one"}, {102, "hundred-two"}}) {
+             {300, "three-hundred"}, {301, "three-hundred-one"}, {302, "three-hundred-two"}}) {
         sub.handleReliableDataFrame(makeReliableFrame(tid, v));
     }
 
     std::lock_guard<std::mutex> lock(mu);
     const std::vector<std::string> expected{
-        "hundred", "hundred-one", "hundred-two"};
+        "three-hundred", "three-hundred-one", "three-hundred-two"};
     EXPECT_EQ(delivered, expected);
 }
 

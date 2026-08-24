@@ -1130,28 +1130,36 @@ void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {
         if (tid == w.nextExpected) {
             deliver(data);
         } else if (tid > w.nextExpected) {
-            if (w.buffer.empty()) {
-                // Fast-forward catch-up (ISSUE #3). An EMPTY window seeing a tid
-                // ahead of nextExpected is the signature of a late-joining
-                // subscriber whose publisher already advanced its seq: the tids
-                // between `nextExpected` and `tid` will never arrive (no NAK/
-                // replay at this layer), so buffering them here would stall the
-                // window forever. Fast-forward nextExpected to the incoming tid
-                // and deliver it, dropping the unrecoverable trailing gap. This
-                // is the accepted one-time catch-up for late joiners (ADR-0002
-                // has no catch-up spec); it supersedes buffering a stale gap on
-                // an otherwise-idle window.
+            if ((tid - w.nextExpected) < kReliableWindowSize
+                && w.buffer.size() < kReliableWindowSize) {
+                // Within the bounded window: hold for reordering. A within-bound
+                // gap is buffered even when the window is empty, because it is
+                // consistent with ordinary in-flight REORDERING (a later tid
+                // arriving before earlier ones) and must NOT supersede it —
+                // fast-forwarding would silently drop frames of a genuine
+                // reorder, weakening ADR-0002's exactly-once/in-order guarantee.
+                // Bounded — if full, drop the incoming (a mid-stream gap is
+                // unrecoverable anyway).
+                w.buffer.emplace(tid, std::move(data));
+            } else if ((tid - w.nextExpected) >= kReliableWindowSize
+                       && w.buffer.empty()) {
+                // A gap past the whole window on a FRESH/EMPTY window is the
+                // signature of a late-joining subscriber whose publisher already
+                // advanced its seq: the tids between `nextExpected` and `tid`
+                // cannot be in flight (they lie beyond the bounded window, and
+                // there is no NAK/replay layer), so they will never arrive.
+                // Fast-forward nextExpected to the incoming tid and deliver it,
+                // dropping the unrecoverable trailing gap. This is the accepted
+                // one-time catch-up for late joiners (ADR-0002 has no catch-up
+                // spec). Kept ONLY on an empty window — a large gap on a
+                // non-empty window is a genuine unrecoverable mid-stream gap and
+                // remains dropped below.
                 w.nextExpected = tid;
                 deliver(data);
-            } else if ((tid - w.nextExpected) < kReliableWindowSize
-                       && w.buffer.size() < kReliableWindowSize) {
-                // Window is mid-stream (buffering an earlier hole / reorder):
-                // a within-bound gap is held for reordering. Bounded — if full,
-                // drop the incoming (mid-stream gap is unrecoverable anyway).
-                w.buffer.emplace(tid, std::move(data));
             }
-            // else (non-empty window, gap beyond the bound) -> drop (stale/
-            // unrecoverable); the window is waiting on a mid-stream gap.
+            // else (non-empty window, gap beyond the bound, or a within-bound
+            // gap while the bound is full) -> drop (stale/unrecoverable); the
+            // window is waiting on a mid-stream gap.
         }
         // tid < w.nextExpected -> duplicate or already delivered -> drop.
     }
