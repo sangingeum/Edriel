@@ -65,6 +65,13 @@ struct Config {
     /// interfaces. Cross-subnet / multicast-blind nodes set this so the
     /// config seed (ADR-0002 Channel D) can still reach them.
     std::vector<std::string> advertiseAddresses;
+    /// Static peer endpoints a multicast-blind subscriber dials directly
+    /// (ADR-0002 Channel D seed). Each entry is an "address:port" endpoint
+    /// (or a bare host address, which gets `grpc_port`); these resolve into
+    /// the subscriber's reliable dial set so a node that cannot hear the
+    /// multicast group can still reach cross-subnet peers. Empty = discover
+    /// peers via multicast only.
+    std::vector<std::string> peerEndpoints;
     /// Cap on advertised Endpoint candidates per heartbeat (MTU guard).
     /// Invalid/0 -> 4; clamped to kMaxAdvertisedEndpointsCap.
     std::size_t maxAdvertisedEndpoints = kDefaultMaxAdvertisedEndpoints;
@@ -111,10 +118,11 @@ std::string parseMulticastAddress(const std::string& value,
  * Keys: `port` (integer), `multicast_ip` (string), `discovery_period_seconds`
  * (integer seconds), `participant_timeout_seconds` (integer seconds),
  * `grpc_port` (integer; reliable-path listener), `advertise_address`
- * (scalar or list of unicast addresses), and `max_advertised_endpoints`
- * (integer cap). Each missing or invalid key falls back to its default
- * independently; a missing or unparseable file also yields the defaults.
- * Never throws on config content.
+ * (scalar or list of unicast addresses), `peers` (scalar or list of static
+ * "address:port" seeds for multicast-blind subscribers), and
+ * `max_advertised_endpoints` (integer cap). Each missing or invalid key falls
+ * back to its default independently; a missing or unparseable file also yields
+ * the defaults. Never throws on config content.
  */
 Config loadConfig(const std::string& configPath = "config.yml");
 

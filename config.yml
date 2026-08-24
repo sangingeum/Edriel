@@ -53,6 +53,15 @@ advertise_address:
   # - 192.168.1.5
   # - 10.0.0.3
 
+# Static peer endpoints for a multicast-blind subscriber to dial directly
+# (ADR-0002 Channel D seed). Use when this node cannot hear the multicast
+# group (cross-subnet, TTL=1, firewalled groups) and must still reach peers.
+# Each entry is an "address:port" endpoint, or a bare host address which
+# defaults to grpc_port. Absent / empty -> multicast-only discovery.
+# peers:
+#   - 192.168.1.5:4000
+#   - 10.0.0.3
+
 # Cap on how many Endpoint candidates the heartbeat advertises (MTU guard so
 # the small heartbeat datagram cannot balloon).
 #   - must be a positive integer; values above 64 clamp to 64

@@ -61,6 +61,8 @@ grpc_port: 4000
 advertise_address:      # optional scalar or list; empty = discover-only
   # - 192.168.1.5
 max_advertised_endpoints: 4
+peers:                  # optional static endpoints for multicast-blind nodes
+  # - 192.168.1.5:4000
 ```
 
 | Key | Valid range | Falls back to |
@@ -71,13 +73,16 @@ max_advertised_endpoints: 4
 | `participant_timeout_seconds` | integer seconds in `1..86400` | `10` |
 | `grpc_port` | integer in `1..65535` | `4000` |
 | `advertise_address` | scalar or list of non-empty strings (IP/hostname); empty/absent = discover-only | *empty list* |
+| `peers` | scalar or list of `address:port` (or bare host → `grpc_port`) static seeds for multicast-blind subscribers | *empty list* |
 | `max_advertised_endpoints` | whole number, capped at `64` | `4` |
 
-The `grpc_port` / `advertise_address` / `max_advertised_endpoints` keys drive the
-reliable path (ADR-0002). Every node runs one gRPC server on `grpc_port` and
-advertises its unicast endpoints (`advertise_address`, plus any auto-discovered
+The `grpc_port` / `advertise_address` / `max_advertised_endpoints` / `peers` keys
+drive the reliable path (ADR-0002). Every node runs one gRPC server on `grpc_port`
+and advertises its unicast endpoints (`advertise_address`, plus any auto-discovered
 interfaces, capped at `max_advertised_endpoints`) on the multicast heartbeat —
-so peers can open reliable streams as soon as they are discovered. See
+so peers can open reliable streams as soon as they are discovered. `peers` is
+the static Channel D seed: a multicast-blind / cross-subnet subscriber that
+cannot hear the group dials the configured peer endpoints directly instead. See
 *Reliable QoS* below.
 
 A missing, unreadable, or malformed `config.yml` behaves exactly like an
@@ -102,6 +107,7 @@ edriel::Edriel edrielCfg(io, config);   // explicit edriel::Config
 `edriel::Config` has `port`, `multicastAddress`, `discoverySendPeriod`
 (`std::chrono::seconds`), `participantTimeout` (`std::chrono::seconds`),
 `grpcPort`, `advertiseAddresses` (`std::vector<std::string>`),
+`peerEndpoints` (`std::vector<std::string>`, the `peers:` Channel D seed),
 `maxAdvertisedEndpoints`, and a diagnostic `fellBackToDefaults` flag. The
 explicit-constructor overload lets a host application supply validated settings
 without a config file being present.

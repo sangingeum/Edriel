@@ -21,6 +21,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "Edriel.hpp"
@@ -96,6 +97,41 @@ autoDiscovery::ParticipantData makeReliableFrame(std::uint64_t tid,
     autoDiscovery::ParticipantData pd;
     pd.set_reliable_data(dm.SerializeAsString());
     return pd;
+}
+
+/// Advertise a publisher with identity (pid,tid,uid) announcing `topic` as
+/// reliable, carrying the given ordered endpoint candidates (multi-homed). Used
+/// to drive the subscriber's reconciliation without a live multicast group.
+autoDiscovery::Message makePubAdvert(
+    std::uint32_t pid, std::uint64_t tid, std::uint64_t uid,
+    const std::string& topic, bool reliable,
+    const std::vector<std::pair<std::string, std::uint32_t>>& endpoints) {
+    autoDiscovery::Message ad;
+    auto* adv = ad.mutable_advertisement();
+    auto* id = adv->mutable_identifier();
+    id->set_pid(pid);
+    id->set_tid(tid);
+    id->set_uid(uid);
+    for (const auto& [addr, port] : endpoints) {
+        auto* ep = id->add_endpoints();
+        ep->set_address(addr);
+        ep->set_port(port);
+        ep->set_transport(autoDiscovery::Endpoint::GRPC_TCP);
+    }
+    auto* tp = adv->mutable_topic();
+    tp->set_topic_name(topic);
+    tp->set_message_type("autoDiscovery.Topic");
+    tp->set_is_publisher(true);
+    tp->set_reliable(reliable);
+    return ad;
+}
+
+/// The identity this node's publisher server registers a dialing subscriber
+/// under (the subscriber's OWN self identity).
+edriel::SubscriberKey selfKey(const Edriel& node) {
+    const auto& self = node.selfIdentityForTest();
+    return edriel::SubscriberKey{static_cast<std::uint32_t>(self.pid),
+                                 self.tid, self.uid};
 }
 
 }  // namespace
@@ -204,4 +240,186 @@ TEST(Reliable, SendMessageRoutesByQoS) {
     // frames are dispatched to the strand socket, not the gRPC path).
     ASSERT_TRUE(pub.registerPublisherTopic<autoDiscovery::Topic>("besteffort_topic", false));
     EXPECT_TRUE(pub.sendMessage("besteffort_topic", makePayloadValue("y")));
+}
+
+TEST(Reliable, MultiHomedAdvanceToNextCandidate) {
+    // A publisher advertised at two endpoint candidates: the FIRST is dead
+    // (connection refused) and the SECOND is a live server. The subscriber's
+    // connect-in-order must advance past the dead candidate and land on the live
+    // one (ADR-0002 §6.3, first-wins-on-reachability).
+    asio::io_context ioPub, ioSub;
+
+    const std::uint16_t deadPort = freeTcpPort();  // grabbed, then closed -> refused
+    edriel::Config cfgPub;
+    cfgPub.grpcPort = freeTcpPort();
+    edriel::Config cfgSub;
+    cfgSub.grpcPort = freeTcpPort();
+
+    Edriel pub(ioPub, cfgPub);
+    Edriel sub(ioSub, cfgSub);
+
+    ASSERT_TRUE(pub.registerPublisherTopic<autoDiscovery::Topic>("sensor", true));
+    std::atomic<int> calls{0};
+    ASSERT_TRUE(sub.registerSubscriberTopic<autoDiscovery::Topic>(
+        "sensor",
+        [&calls](const autoDiscovery::Topic&) { ++calls; }, true));
+    pub.startGrpcServer();
+
+    // pub knows the dialing subscriber (anti-spoof gate accepts it).
+    pub.deliverForTest(makeAdvert(sub.selfIdentityForTest(), "sensor", false, true,
+                                  "127.0.0.1", cfgSub.grpcPort));
+    // sub sees a publisher X advertised at [dead, live].
+    sub.deliverForTest(makePubAdvert(77, 7, 20201u, "sensor", true,
+                                     {{"127.0.0.1", deadPort},
+                                      {"127.0.0.1", cfgPub.grpcPort}}));
+
+    sub.startReliableSubscriptions();
+
+    // The connection resolves to the SECOND (live) candidate.
+    ASSERT_TRUE(waitUntil([&]() { return pub.subscriberConnectedForTest(selfKey(sub)); }, 4000))
+        << "multi-homed connect did not advance to the live candidate";
+}
+
+TEST(Reliable, ReDialOnEndpointChange) {
+    // The same publisher identity is discovered at endpoint P1, connected, then
+    // re-advertises at a new endpoint P2 (IP change / peer move under the same
+    // (pid,tid,uid)). Reconciliation must tear down the stale P1 connection and
+    // re-dial P2 (ADR-0002 §5 stale-endpoint re-dial).
+    asio::io_context ioPub1, ioPub2, ioSub;
+
+    edriel::Config cfgPub1;
+    cfgPub1.grpcPort = freeTcpPort();
+    edriel::Config cfgPub2;
+    cfgPub2.grpcPort = freeTcpPort();
+    edriel::Config cfgSub;
+    cfgSub.grpcPort = freeTcpPort();
+
+    Edriel pub1(ioPub1, cfgPub1);
+    Edriel pub2(ioPub2, cfgPub2);
+    Edriel sub(ioSub, cfgSub);
+
+    ASSERT_TRUE(pub1.registerPublisherTopic<autoDiscovery::Topic>("sensor", true));
+    ASSERT_TRUE(pub2.registerPublisherTopic<autoDiscovery::Topic>("sensor", true));
+    std::atomic<int> calls{0};
+    ASSERT_TRUE(sub.registerSubscriberTopic<autoDiscovery::Topic>(
+        "sensor",
+        [&calls](const autoDiscovery::Topic&) { ++calls; }, true));
+    pub1.startGrpcServer();
+    pub2.startGrpcServer();
+
+    // Both servers know the dialing subscriber (anti-spoof).
+    pub1.deliverForTest(makeAdvert(sub.selfIdentityForTest(), "sensor", false, true,
+                                   "127.0.0.1", cfgSub.grpcPort));
+    pub2.deliverForTest(makeAdvert(sub.selfIdentityForTest(), "sensor", false, true,
+                                   "127.0.0.1", cfgSub.grpcPort));
+
+    constexpr std::uint32_t kPid = 77;
+    constexpr std::uint64_t kTid = 7;
+    constexpr std::uint64_t kUid = 30303u;  // the publisher identity
+
+    // Phase 1: publisher X lives at P1.
+    sub.deliverForTest(makePubAdvert(kPid, kTid, kUid, "sensor", true,
+                                     {{"127.0.0.1", cfgPub1.grpcPort}}));
+    sub.startReliableSubscriptions();
+    ASSERT_TRUE(waitUntil([&]() { return pub1.subscriberConnectedForTest(selfKey(sub)); }, 4000))
+        << "initial connection to P1 never established";
+
+    // Phase 2: X moves to P2. Reconcile again with the new advertised endpoint.
+    sub.deliverForTest(makePubAdvert(kPid, kTid, kUid, "sensor", true,
+                                     {{"127.0.0.1", cfgPub2.grpcPort}}));
+    sub.startReliableSubscriptions();
+
+    ASSERT_TRUE(waitUntil([&]() {
+        return !pub1.subscriberConnectedForTest(selfKey(sub))
+            && pub2.subscriberConnectedForTest(selfKey(sub));
+    }, 5000))
+        << "re-dial did not move off the stale P1 onto the new P2 endpoint";
+}
+
+TEST(Reliable, StaticPeerSeedChannelD) {
+    // Channel D (ADR-0002): a multicast-blind subscriber learns no publisher via
+    // discovery but dials a configured static `peers:` endpoint directly. With a
+    // live server there, the dial lands and reliable frames flow.
+    asio::io_context ioPub, ioSub;
+
+    edriel::Config cfgPub;
+    cfgPub.grpcPort = freeTcpPort();
+    const std::string peerEndpoint = "127.0.0.1:" + std::to_string(cfgPub.grpcPort);
+
+    edriel::Config cfgSub;
+    cfgSub.grpcPort = freeTcpPort();
+    cfgSub.peerEndpoints.push_back(peerEndpoint);
+
+    Edriel pub(ioPub, cfgPub);
+    Edriel sub(ioSub, cfgSub);
+
+    ASSERT_TRUE(pub.registerPublisherTopic<autoDiscovery::Topic>("sensor", true));
+    std::atomic<int> calls{0};
+    std::string received;
+    std::mutex mu;
+    ASSERT_TRUE(sub.registerSubscriberTopic<autoDiscovery::Topic>(
+        "sensor",
+        [&calls, &received, &mu](const autoDiscovery::Topic& t) {
+            ++calls;
+            std::lock_guard<std::mutex> lock(mu);
+            received = t.topic_name();
+        },
+        true));
+    pub.startGrpcServer();
+
+    // The peer server must know the dialing subscriber (anti-spoof).
+    pub.deliverForTest(makeAdvert(sub.selfIdentityForTest(), "sensor", false, true,
+                                  "127.0.0.1", cfgSub.grpcPort));
+
+    // No multicast advertisement reaches `sub`; only the static peer seed.
+    sub.startReliableSubscriptions();
+
+    ASSERT_TRUE(waitUntil([&]() { return pub.subscriberConnectedForTest(selfKey(sub)); }, 4000))
+        << "static Channel D peer was never dialed";
+
+    EXPECT_TRUE(pub.sendMessage("sensor", makePayloadValue("seed-42")));
+    ASSERT_TRUE(waitUntil([&]() { return calls.load() == 1; }, 3000))
+        << "no reliable frame over the static-peer stream";
+    std::lock_guard<std::mutex> lock(mu);
+    EXPECT_EQ(received, "seed-42");
+}
+
+TEST(Reliable, MtuRejectOnOversizedFrame) {
+    // The reliable path shares the multicast data-plane MTU budget (1500 B):
+    // an oversized reliable frame is rejected at send time (returns false) and
+    // a within-budget frame still flows.
+    asio::io_context ioPub, ioSub;
+
+    edriel::Config cfgPub;
+    cfgPub.grpcPort = freeTcpPort();
+    edriel::Config cfgSub;
+    cfgSub.grpcPort = freeTcpPort();
+
+    Edriel pub(ioPub, cfgPub);
+    Edriel sub(ioSub, cfgSub);
+
+    ASSERT_TRUE(pub.registerPublisherTopic<autoDiscovery::Topic>("sensor", true));
+    std::atomic<int> calls{0};
+    ASSERT_TRUE(sub.registerSubscriberTopic<autoDiscovery::Topic>(
+        "sensor",
+        [&calls](const autoDiscovery::Topic&) { ++calls; }, true));
+    pub.startGrpcServer();
+    sub.startGrpcServer();
+
+    pub.deliverForTest(makeAdvert(sub.selfIdentityForTest(), "sensor", false, true,
+                                  "127.0.0.1", cfgSub.grpcPort));
+    sub.deliverForTest(makeAdvert(pub.selfIdentityForTest(), "sensor", true, true,
+                                  "127.0.0.1", cfgPub.grpcPort));
+
+    sub.startReliableSubscriptions();
+    ASSERT_TRUE(waitUntil([&]() { return pub.subscriberConnectedForTest(selfKey(sub)); }, 3000));
+
+    // A reliable payload that serializes past the 1500-byte budget -> rejected.
+    autoDiscovery::Topic big;
+    big.set_topic_name(std::string(3000, 'x'));
+    EXPECT_FALSE(pub.sendMessage("sensor", big));
+
+    // A normal-size reliable message still flows exactly once.
+    EXPECT_TRUE(pub.sendMessage("sensor", makePayloadValue("42")));
+    ASSERT_TRUE(waitUntil([&]() { return calls.load() == 1; }, 3000));
 }

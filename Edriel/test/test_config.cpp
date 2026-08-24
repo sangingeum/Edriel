@@ -340,3 +340,58 @@ TEST(LoadConfig, GrpcKeysKeepOtherKeys) {
     EXPECT_EQ(cfg.advertiseAddresses[0], "10.1.2.3");
     EXPECT_FALSE(cfg.fellBackToDefaults);
 }
+
+// --- loadConfig: peers Channel D seed --------------------------------------
+
+TEST(LoadConfig, ParsesPeerEndpointsWithExplicitPorts) {
+    const auto path = writeTempConfig(
+        "peers:\n"
+        "  - 192.168.1.5:4000\n"
+        "  - 10.0.0.3:4400\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    ASSERT_EQ(cfg.peerEndpoints.size(), 2u);
+    EXPECT_EQ(cfg.peerEndpoints[0], "192.168.1.5:4000");
+    EXPECT_EQ(cfg.peerEndpoints[1], "10.0.0.3:4400");
+}
+
+TEST(LoadConfig, BareHostPeerDefaultsToGrpcPort) {
+    // A bare host without a port inherits the configured grpc_port.
+    const auto path = writeTempConfig(
+        "grpc_port: 4700\n"
+        "peers:\n"
+        "  - 192.168.1.9\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    ASSERT_EQ(cfg.peerEndpoints.size(), 1u);
+    EXPECT_EQ(cfg.peerEndpoints[0], "192.168.1.9:4700");
+}
+
+TEST(LoadConfig, ScalarPeerAccepted) {
+    const auto path = writeTempConfig("peers: 192.168.1.5:4000\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    ASSERT_EQ(cfg.peerEndpoints.size(), 1u);
+    EXPECT_EQ(cfg.peerEndpoints[0], "192.168.1.5:4000");
+}
+
+TEST(LoadConfig, MissingPeersLeavesEmpty) {
+    const auto path = writeTempConfig("port: 30002\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_TRUE(cfg.peerEndpoints.empty());
+}
+
+TEST(LoadConfig, InvalidPeerEntryIsSkipped) {
+    // A non-port suffix is dropped (and the fallback flag is set), while a
+    // later valid entry is still honored.
+    const auto path = writeTempConfig(
+        "peers:\n"
+        "  - 192.168.1.5:notaport\n"
+        "  - 10.0.0.3:4400\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    ASSERT_EQ(cfg.peerEndpoints.size(), 1u);
+    EXPECT_EQ(cfg.peerEndpoints[0], "10.0.0.3:4400");
+    EXPECT_TRUE(cfg.fellBackToDefaults);
+}

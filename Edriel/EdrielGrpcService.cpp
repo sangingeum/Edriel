@@ -22,19 +22,28 @@ SubscriberReactor::~SubscriberReactor() = default;
 
 void SubscriberReactor::OnReadDone(bool ok) {
     if (!ok) {
-        // The client half-closed its side. Finish cleanly once no write is in
-        // flight (defer to OnWriteDone if one is).
+        // The client half-closed its side. Drain any queued frames first, then
+        // finish cleanly once the outbox is empty (defer to OnWriteDone if a
+        // write is in flight).
         bool canFinish = false;
+        bool needKick = false;
         {
             std::lock_guard<std::mutex> lock(m_);
             if (writing_) {
-                finishPending_ = true;
-            } else {
+                finishPending_ = true;      // finish after the in-flight write
+            } else if (outbox_.empty()) {
                 canFinish = true;
+            } else {
+                finishPending_ = true;      // drain the rest, then finish
+                needKick = true;
             }
         }
         if (canFinish) {
             Finish(grpc::Status::OK);
+            return;
+        }
+        if (needKick) {
+            startWrite_();
         }
         return;
     }
@@ -44,6 +53,17 @@ void SubscriberReactor::OnReadDone(bool ok) {
     if (!initialised_) {
         initialised_ = true;
         key_ = SubscriberKey{heartbeat_.pid(), heartbeat_.tid(), heartbeat_.uid()};
+
+        // Anti-spoof gate (ADR-0002 §6.2): only a *known* participant (present
+        // in the registry with a matching (pid,tid,uid)) may register and be fed
+        // frames. Unknown dialers are finished without registration, closing the
+        // stream before it can receive presence or reliable data.
+        if (!service_.owner().isKnownParticipant(key_.pid, key_.tid, key_.uid)) {
+            Finish(grpc::Status(grpc::StatusCode::PERMISSION_DENIED,
+                                "unknown dialer: not a known participant"));
+            return;
+        }
+
         service_.registerSubscriber(key_, this);
 
         for (autoDiscovery::ParticipantData& pd
@@ -57,19 +77,26 @@ void SubscriberReactor::OnReadDone(bool ok) {
 }
 
 void SubscriberReactor::OnWriteDone(bool ok) {
-    bool finishNow;
     {
         std::lock_guard<std::mutex> lock(m_);
         writing_ = false;
-        finishNow = finishPending_;  // client half-closed while we were writing
     }
-    if (finishNow || !ok) {
-        Finish(ok ? grpc::Status::OK
-                  : grpc::Status(grpc::StatusCode::CANCELLED, "stream broken"));
+    if (!ok) {
+        Finish(grpc::Status(grpc::StatusCode::CANCELLED, "stream broken"));
         return;
     }
-    // Drain any further queued frames.
+    // Drain any further queued frames. A client half-close while the outbox is
+    // non-empty must not cut the queued presence/data frames short: keep
+    // writing, and only finish once the outbox empties.
     startWrite_();
+    bool finishNow;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        finishNow = finishPending_ && !writing_ && outbox_.empty();
+    }
+    if (finishNow) {
+        Finish(grpc::Status::OK);
+    }
 }
 
 void SubscriberReactor::OnDone() {
@@ -93,7 +120,7 @@ void SubscriberReactor::enqueue(autoDiscovery::ParticipantData&& frame) {
 void SubscriberReactor::startWrite_() {
     {
         std::lock_guard<std::mutex> lock(m_);
-        if (writing_ || outbox_.empty() || finishPending_) {
+        if (writing_ || outbox_.empty()) {
             return;
         }
         writeBuffer_ = std::move(outbox_.front());

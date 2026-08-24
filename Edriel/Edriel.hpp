@@ -240,6 +240,10 @@ private:
     // ParticipantStreamService on config_.grpcPort.
     std::unique_ptr<grpc::Server> grpcServer_;
     std::unique_ptr<ParticipantStreamServiceImpl> grpcService_;
+    /// Guards `grpcServer_`/`grpcService_` lifecycle against a concurrent
+    /// reliable send: startGrpcServer/stopGrpcServer and publishReliable share
+    /// this barrier so a send cannot dereference a destroyed service.
+    mutable std::mutex grpcServiceMutex_;
 
     // ------------------------------------------------------------------------
     // Reliable send/receive state (ADR-0002 M4/M5)
@@ -462,8 +466,11 @@ private:
 
     /**
      * @brief Reconciles the subscriber-client connection set against the
-     *        current publishers of locally reliable topics (dial/stop on
-     *        endpoint-set/participant change).
+     *        current publishers of locally reliable topics: dial new ones with
+     *        their ordered candidate endpoints (connect-in-order), tear down
+     *        those whose publisher left, and re-dial a connection whose
+     *        currently-connected endpoint is no longer advertised (endpoint
+     *        change). Also resolves the static `peers:` seed (Channel D).
      */
     void reconcileReliableConnections();
 
@@ -551,6 +558,16 @@ public:
                                autoDiscovery::ParticipantData& out) const;
 
     /**
+     * @brief Whether a (pid,tid,uid) is a known peer in this node's registry —
+     *        either a discovered participant or a topic publisher/subscriber.
+     *
+     * Internal accessor used by the gRPC service's anti-spoof gate (ADR-0002
+     * §6.2): a dialer that is not a known participant is rejected before its
+     * stream is registered or fed frames.
+     */
+    bool isKnownParticipant(std::uint32_t pid, std::uint64_t tid, std::uint64_t uid);
+
+    /**
      * @brief Snapshot of every registered peer as ParticipantData (presence).
      *
      * Internal accessor used by the gRPC service to push discovery presence on
@@ -564,8 +581,11 @@ public:
      *
      * Dialing is subscriber-initiated (ADR-0002): for each reliable topic this
      * node subscribes to, ensure a StreamParticipants connection to each
-     * current publisher (first advertised endpoint), re-dialing on break.
-     * Called automatically on each discovery cleanup; safe to call again.
+     * current publisher, dialing its ordered candidate endpoints
+     * (connect-in-order, multi-homed) and re-dialing on break or on an
+     * advertised-endpoint change. Also resolves the static `peers:` seed
+     * (Channel D). Called automatically on each discovery cleanup; safe to
+     * call again.
      */
     void startReliableSubscriptions();
 

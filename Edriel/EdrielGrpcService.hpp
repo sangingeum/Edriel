@@ -6,12 +6,14 @@
  * instance:
  *   - GetParticipantInfo (unary): a participant's ParticipantData — the
  *     post-connect verifier/refresher (Channel C in ADR-0002).
- *   - StreamParticipants (bidi): a subscriber dials, the server pushes
- *     ParticipantData presence then reliable payload frames over the stream.
- *
- * The service uses the grpcpp **callback** API (ServerBidiReactor), which is
- * the gRPC-recommended design when a server must push data asynchronously from
- * producer threads (the publisher's io_context) into a long-lived stream — the
+  *   - StreamParticipants (bidi): a subscriber dials, the server gates its
+  *     identity against the participant registry (anti-spoof, §6.2), then
+  *     pushes ParticipantData presence then reliable payload frames over the
+  *     stream.
+  *
+  * The service uses the grpcpp **callback** API (ServerBidiReactor), which is
+  * the gRPC-recommended design when a server must push data asynchronously from
+  * producer threads (the publisher's io_context) into a long-lived stream — the
  * synchronous ServerReaderWriter is not concurrent-safe. The reactor's
  * per-subscriber outbox is drained to StartWrite, so StartWrite can be called
  * from any thread safely.

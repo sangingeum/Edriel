@@ -11,6 +11,7 @@
 #include "EdrielReliableClient.hpp"
 #include <asio/steady_timer.hpp>
 #include <google/protobuf/descriptor.h>
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <fstream>
@@ -202,6 +203,47 @@ std::vector<autoDiscovery::Endpoint> collectEndpoints(const autoDiscovery::Ident
         out.push_back(id.endpoints(i));
     }
     return out;
+}
+
+/// Turn an advertised Endpoint set into ordered "address:port" dial candidates
+/// (multi-homed, tried in order — ADR-0002 §6.3).
+std::vector<std::string> endpointCandidates(const std::vector<autoDiscovery::Endpoint>& eps) {
+    std::vector<std::string> out;
+    out.reserve(eps.size());
+    for (const autoDiscovery::Endpoint& ep : eps) {
+        out.push_back(ep.address() + ":" + std::to_string(ep.port()));
+    }
+    return out;
+}
+
+/// FNV-1a 64-bit over the endpoint string; the basis for a deterministic
+/// (and distinct) synthesized identity for a static seed peer (ADR-0002
+/// Channel D), which has no advisory pid/tid/uid of its own.
+std::uint64_t fnv1a64(const std::string& s) {
+    std::uint64_t h = 14695981039346656037ull;
+    for (const char c : s) {
+        h ^= static_cast<std::uint8_t>(c);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+/// Deterministic SubscriberKey derived from a static peer "address:port"
+/// endpoint, so the reconciliation's (pid,tid,uid) keying stays valid for a
+/// config-seeded peer that is never heard on the multicast group. The hash is
+/// split into independent pid/high-uid halves to keep distinct endpoints from
+/// collapsing onto the same key.
+SubscriberKey peerKeyForEndpoint(const std::string& endpoint) {
+    const std::uint64_t h = fnv1a64(endpoint);
+    std::uint32_t pid = static_cast<std::uint32_t>(h >> 1);
+    if (pid == 0) {
+        pid = 1;  // keep the identity non-zero/null
+    }
+    std::uint64_t uid = (h << 33) ^ (h >> 31);
+    if (uid == 0) {
+        uid = 1;
+    }
+    return SubscriberKey{pid, 0ull, uid};
 }
 
 // ============================================================================
@@ -579,6 +621,22 @@ void Edriel::removeTimedOutParticipants() {
 
             // Remove and advance
             it = participants.erase(it);
+
+            // Prune this peer's per-(publisher,topic) reliable receiver windows
+            // (ADR-0002 §5 lifecycle: a timed-out participant's endpoints and
+            // streams vanish with it). Without this the windows map grows
+            // without bound as peers cycle through the registry.
+            // reliablePublisherSeq_ is keyed by topic (bounded by topic count),
+            // not per-pub, so it needs no peer-keyed pruning.
+            const std::string winPrefix = std::to_string(stale.uid) + "|";
+            auto win = reliableWindows_.begin();
+            while (win != reliableWindows_.end()) {
+                if (win->first.rfind(winPrefix, 0) == 0) {
+                    win = reliableWindows_.erase(win);
+                } else {
+                    ++win;
+                }
+            }
         } else {
             ++it;
         }
@@ -820,6 +878,7 @@ void Edriel::stopAutoDiscovery() {
 // ============================================================================
 
 void Edriel::startGrpcServer() {
+    std::lock_guard<std::mutex> lock(grpcServiceMutex_);
     if (grpcServer_) {
         return;  // already serving
     }
@@ -842,6 +901,7 @@ void Edriel::startGrpcServer() {
 }
 
 void Edriel::stopGrpcServer() {
+    std::lock_guard<std::mutex> lock(grpcServiceMutex_);
     if (grpcServer_) {
         grpcServer_->Shutdown();  // reject new RPCs, cancel in-flight streams
         grpcServer_->Wait();      // drain before teardown
@@ -901,6 +961,35 @@ std::vector<autoDiscovery::ParticipantData> Edriel::snapshotParticipantData() co
     return presence;
 }
 
+bool Edriel::isKnownParticipant(std::uint32_t pid, std::uint64_t tid, std::uint64_t uid) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    const auto matches = [pid, tid, uid](const Participant& p) {
+        return p.pid == pid && p.tid == tid && p.uid == uid;
+    };
+    for (const Participant& p : participants) {
+        if (matches(p)) {
+            return true;
+        }
+    }
+    // A peer that has announced a topic subscription/publish is `known` even
+    // before/cross- the heartbeat path populates `participants`; gate against
+    // both so a genuine topic-peer dial is accepted but a random non-participant
+    // is rejected (ADR-0002 §6.2 anti-spoof).
+    for (const auto& kv : topicRegistry) {
+        for (const Participant& p : kv.second.publishers) {
+            if (matches(p)) {
+                return true;
+            }
+        }
+        for (const Participant& p : kv.second.subscribers) {
+            if (matches(p)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // ============================================================================
 // Reliable send path (ADR-0002 M4/M5)
 // ============================================================================
@@ -908,6 +997,7 @@ std::vector<autoDiscovery::ParticipantData> Edriel::snapshotParticipantData() co
 bool Edriel::publishReliable(const std::string& topicName,
                              const std::string& messageType,
                              const std::string& payload) {
+    std::lock_guard<std::mutex> gLock(grpcServiceMutex_);
     if (!grpcService_) {
         std::cerr << "[Edriel] Reliable send on '" << topicName
                   << "' but no gRPC server is serving\n";
@@ -917,7 +1007,7 @@ bool Edriel::publishReliable(const std::string& topicName,
     const std::string key = makeCompositeKey(topicName, messageType);
 
     std::set<Participant> subscribers;
-    std::uint64_t seq = 0;
+    std::uint64_t nextSeq = 0;
     {
         std::lock_guard<std::mutex> lock(stateMutex);
         const auto it = topicRegistry.find(key);
@@ -925,14 +1015,17 @@ bool Edriel::publishReliable(const std::string& topicName,
             return false;  // no subscribers for this reliable topic
         }
         subscribers = it->second.subscribers;
-        seq = ++reliablePublisherSeq_[key];
+        // Tentative next tid. Commit only if the frame passes the MTU guard
+        // below, so a locally-rejected (never placed on the wire) frame cannot
+        // consume a sequence number and permanently gap a subscriber's window.
+        nextSeq = reliablePublisherSeq_[key] + 1;
     }
 
     // Stamp a per-(publisher, topic) tid (reusing Identifier.tid) so the
     // receiver's reorder/dedup window can deliver exactly-once in order.
     autoDiscovery::DataMessage data;
     data.mutable_identifier()->set_pid(selfParticipant.pid);
-    data.mutable_identifier()->set_tid(seq);
+    data.mutable_identifier()->set_tid(nextSeq);
     data.mutable_identifier()->set_uid(selfParticipant.uid);
     data.set_topic_name(topicName);
     data.set_message_type(messageType);
@@ -952,6 +1045,13 @@ bool Edriel::publishReliable(const std::string& topicName,
                   << serialized.size() << " bytes, exceeds "
                   << recvBufferSize << "-byte MTU budget, dropping\n";
         return false;
+    }
+
+    // Commit the sequence number now that the frame is guaranteed to be sent
+    // (sends are serialized by grpcServiceMutex_, so no two threads race here).
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        reliablePublisherSeq_[key] = nextSeq;
     }
 
     bool pushedAny = false;
@@ -1023,8 +1123,17 @@ void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {
                 if (w.buffer.size() < kReliableWindowSize) {
                     w.buffer.emplace(tid, std::move(data));
                 }
+            } else if (w.buffer.empty()) {
+                // A gap past the whole window on a fresh/empty window means the
+                // preceding tids will never arrive (late-joining subscriber whose
+                // publisher already advanced its seq). Fast-forward the window to
+                // the incoming tid and deliver rather than buffer forever — the
+                // buffer is empty, so nothing cancels in-flight ordering.
+                w.nextExpected = tid;
+                deliver(data);
             }
-            // else: gap beyond the window bound -> drop (stale/unrecoverable)
+            // else (non-empty window, gap beyond the bound) -> drop (stale/
+            // unrecoverable); the window is waiting on a mid-stream gap.
         }
         // tid < w.nextExpected -> duplicate or already delivered -> drop.
     }
@@ -1050,12 +1159,14 @@ void Edriel::reconcileReliableConnections() {
     // Snapshot the publishers we must dial for locally reliable subscriptions.
     struct Target {
         SubscriberKey key;
-        std::string endpoint;
+        std::vector<std::string> candidates;  // ordered "address:port" endpoints
     };
     std::vector<Target> needed;
+    bool subscribedReliable = false;
     {
         std::lock_guard<std::mutex> lock(stateMutex);
-        // Canonical endpoints live in the global `participants` set (AdR-0002:
+        subscribedReliable = !reliableSubscribedTopics_.empty();
+        // Canonical endpoints live in the global `participants` set (ADR-0002:
         // refreshed on every heartbeat). The topicRegistry stores bare snapshots
         // without endpoints, so cross-reference by (pid,tid,uid) for the reachable
         // candidates of each publisher we must dial.
@@ -1078,11 +1189,21 @@ void Edriel::reconcileReliableConnections() {
                 if (eps == nullptr || eps->empty()) {
                     continue;
                 }
-                const autoDiscovery::Endpoint& ep = eps->front();
                 needed.push_back(Target{
                     {static_cast<std::uint32_t>(pub.pid), pub.tid, pub.uid},
-                    ep.address() + ":" + std::to_string(ep.port())});
+                    endpointCandidates(*eps)});
             }
+        }
+    }
+
+    // Static config seed (ADR-0002 Channel D): multicast-blind / cross-subnet
+    // peers have no registry presence (never heard on the group) but still must
+    // be reached for any reliable subscription. Resolve them directly into the
+    // dial set with a deterministic identity so reconcile stays keyed by
+    // (pid,tid,uid). Only dial while there is at least one reliable topic.
+    if (subscribedReliable) {
+        for (const std::string& peer : config_.peerEndpoints) {
+            needed.push_back(Target{peerKeyForEndpoint(peer), {peer}});
         }
     }
 
@@ -1105,14 +1226,27 @@ void Edriel::reconcileReliableConnections() {
         }
     }
 
-    // Dial publishers we are not yet connected to (connect-in-order, first
-    // advertised endpoint wins).
+    // Dial publishers we are not yet connected to, and re-dial a connection
+    // whose *currently-connected endpoint* is no longer in the publisher's
+    // advertised set (endpoint change / IP move / peer restart under the same
+    // identity — ADR-0002 §5). Connect-in-order (first advertised candidate),
+    // and the connection owns the candidate fallback (multi-homed §6.3).
     for (const Target& t : needed) {
-        if (reliableConnections_.count(t.key) != 0) {
-            continue;
+        const auto existing = reliableConnections_.find(t.key);
+        if (existing != reliableConnections_.end()) {
+            const std::string connected = existing->second->currentEndpoint();
+            const bool connectedStale = !connected.empty() &&
+                std::find(t.candidates.begin(), t.candidates.end(), connected)
+                    == t.candidates.end();
+            if (!connectedStale) {
+                continue;  // still connected to a currently advertised endpoint
+            }
+            // Re-dial: the peer moved to a new endpoint set this node isn't on.
+            existing->second->stop();
         }
+
         auto conn = std::make_unique<ReliableSubscriberConnection>(
-            *this, t.key, t.endpoint,
+            *this, t.key, t.candidates,
             static_cast<std::uint32_t>(selfParticipant.pid), selfParticipant.tid,
             selfParticipant.uid);
         conn->start();

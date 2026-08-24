@@ -243,6 +243,53 @@ Config loadConfig(const std::string& configPath) {
             // key absent -> empty address list (advertise discovered interfaces),
             // not a fallback.
         }
+        if (const YAML::Node peersNode = root["peers"]; peersNode) {
+            // Static peer seeds for a multicast-blind subscriber to dial
+            // (ADR-0002 Channel D). Each entry is an "address:port" endpoint,
+            // or a bare host address which defaults to `grpc_port` (kept in
+            // sync with the already-parsed grpc_port above). An absent/empty
+            // key is a legitimate multicast-only state, NOT a fallback; only
+            // a genuinely malformed node (a map, or a non-string/non-port
+            // entry) flags the fallback diagnostics.
+            bool anyInvalid = false;
+            const auto addPeer = [&](const std::string& raw) {
+                if (raw.empty()) {
+                    anyInvalid = true;
+                    return;
+                }
+                const std::size_t colon = raw.rfind(':');
+                std::string endpoint;
+                if (colon == std::string::npos) {
+                    // Bare host: default its port to the configured grpc_port.
+                    endpoint = raw + ":" + std::to_string(config.grpcPort);
+                } else {
+                    const std::uint16_t port =
+                        parsePort(raw.substr(colon + 1), 0);
+                    if (port == 0) {
+                        anyInvalid = true;
+                        return;  // invalid port suffix -> skip this peer
+                    }
+                    endpoint = raw;
+                }
+                config.peerEndpoints.push_back(endpoint);
+            };
+            if (peersNode.IsScalar()) {
+                addPeer(peersNode.as<std::string>());
+            } else if (peersNode.IsSequence()) {
+                for (const YAML::Node& entry : peersNode) {
+                    if (!entry.IsScalar()) {
+                        anyInvalid = true;
+                        continue;
+                    }
+                    addPeer(entry.as<std::string>());
+                }
+            } else {
+                anyInvalid = true;
+            }
+            if (anyInvalid) {
+                config.fellBackToDefaults = true;
+            }
+        }
     } catch (const YAML::Exception&) {
         // Unparseable YAML -> fall back to the defaults.
         return config;
