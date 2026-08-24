@@ -51,6 +51,7 @@ build_asan
 build_fresh
 build_pf
 build_pf_gen
+cmbuild_*
 
 # VS
 .vs

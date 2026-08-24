@@ -40,5 +40,10 @@ message ParticipantData {
   // ADDITIVE proto3 field (field 8); old peers ignore it. Multiple candidates
   // express multi-homed reachability; try in order, first-wins.
   repeated Endpoint endpoints = 8;
+  // Reliable payload frame (ADR-0002): one serialized DataMessage carrying a
+  // reliable topic's payload, pushed by the publisher over the subscriber's
+  // StreamParticipants stream. Distinct from presence ParticipantData, which
+  // leaves this field empty. ADDITIVE proto3 (field 9); old peers ignore it.
+  bytes reliable_data = 9;
   // TODO: Add capability flags (supports streaming, etc.)
 }

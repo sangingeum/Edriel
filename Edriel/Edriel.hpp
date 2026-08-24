@@ -25,6 +25,7 @@
 #include <mutex>   // registry synchronization
 #include <tuple>   // std::tie in Participant::operator<
 #include "EdrielConfig.hpp"
+#include "EdrielGrpcService.hpp"
 
 // ============================================================================
 // Topic Info Structure
@@ -49,9 +50,18 @@ inline std::string makeCompositeKey(const std::string& topicName,
  */
 constexpr uint32_t MAGIC_NUMBER = 0xED75E1ED;
 
+/// Bounded reorder/dedup window for the reliable receiver (exactly-once per
+/// (publisher, topic)). Out-of-order reliable frames buffer within this many
+/// tids; older-than-window duplicates are dropped.
+inline constexpr std::size_t kReliableWindowSize = 256;
+
 // Forward declaration: the gRPC ParticipantStreamService server for the
 // reliable path (ADR-0002), implemented in EdrielGrpcService.{hpp,cpp}.
 class ParticipantStreamServiceImpl;
+
+// Forward declaration: one dial from this (subscriber) node to a publisher,
+// implemented in EdrielReliableClient.{hpp,cpp}.
+class ReliableSubscriberConnection;
 
 // ============================================================================
 // Concept for protobuf message types used in topic registration/sending
@@ -230,6 +240,29 @@ private:
     // ParticipantStreamService on config_.grpcPort.
     std::unique_ptr<grpc::Server> grpcServer_;
     std::unique_ptr<ParticipantStreamServiceImpl> grpcService_;
+
+    // ------------------------------------------------------------------------
+    // Reliable send/receive state (ADR-0002 M4/M5)
+    // ------------------------------------------------------------------------
+    /// Bounded exactly-once (and in-order) receiver window per (publisher
+    /// uid, topic). `nextExpected` is the next contiguous per-(pub,topic) tid;
+    /// out-of-order frames buffer up to `kReliableWindowSize`.
+    struct ReliableRxWindow {
+        std::uint64_t nextExpected = 1;
+        std::map<std::uint64_t, autoDiscovery::DataMessage> buffer;
+    };
+    /// Windows are mutable; updates come from subscriber-client threads.
+    mutable std::map<std::string, ReliableRxWindow> reliableWindows_;
+    /// Per-(publisher,topic) monotonic sequence stamps (reuses Identifier.tid).
+    std::map<std::string, std::uint64_t> reliablePublisherSeq_;
+    /// Composite keys of topics this node subscribes to with reliable QoS;
+    /// these drive which publishers this node dials.
+    std::set<std::string> reliableSubscribedTopics_;
+
+    /// Subscriber-client connections (this node dialing publishers).
+    mutable std::mutex reliableConnMutex_;
+    std::map<SubscriberKey, std::unique_ptr<ReliableSubscriberConnection>>
+        reliableConnections_;
     
     // ========================================================================
     // Discovery Message Buffer
@@ -259,6 +292,9 @@ private:
     struct TopicEntry {
         std::string topicName;      ///< Base topic name
         std::string messageType;    ///< Protobuf message type name
+        /// True when this node registered the topic as reliable (QoS): send
+        /// traffic over the gRPC path; best-effort otherwise (multicast).
+        bool reliable = false;
         std::set<Participant> publishers;    ///< Remote participants publishing this topic
         std::set<Participant> subscribers;   ///< Remote participants subscribing to this topic
         /// Local typed callbacks invoked on matching received data messages.
@@ -288,6 +324,16 @@ private:
     }
     const std::set<Participant>& participantsForTest() const {
         return participants;
+    }
+    /// This node's self-identity (test hook for wiring consistent registry
+    /// snapshots without multicast).
+    const Participant& selfIdentityForTest() const {
+        return selfParticipant;
+    }
+    /// Whether a subscriber stream for `key` is currently registered on this
+    /// node's server (test hook to wait for the reliable dial to land).
+    bool subscriberConnectedForTest(const SubscriberKey& key) const {
+        return grpcService_ && grpcService_->hasSubscriber(key);
     }
     void deliverForTest(const autoDiscovery::Message& msg) {
         handleAutoDiscoveryParse(msg);
@@ -405,6 +451,23 @@ private:
                      const std::string& payload);
 
     /**
+     * @brief Pushes a reliable DataMessage over the subscriber streams of a
+     * topic. Stamps a per-(publisher,topic) tid (reusing Identifier.tid) so the
+     * receiver can dedup/reorder to exactly-once. Serves from the gRPC server's
+     * subscriber table (publisher side of subscriber-initiated dialing).
+     * @return true if pushed to at least one connected subscriber
+     */
+    bool publishReliable(const std::string& topicName, const std::string& messageType,
+                         const std::string& payload);
+
+    /**
+     * @brief Reconciles the subscriber-client connection set against the
+     *        current publishers of locally reliable topics (dial/stop on
+     *        endpoint-set/participant change).
+     */
+    void reconcileReliableConnections();
+
+    /**
      * @brief Schedules a function on this object's strand
      * @param thunk Invoked by the io_context's strand executor
      */
@@ -495,22 +558,51 @@ public:
      */
     std::vector<autoDiscovery::ParticipantData> snapshotParticipantData() const;
 
+    /**
+     * @brief Drives this node's subscriber-client connections to the
+     *        publishers of every locally registered reliable topic.
+     *
+     * Dialing is subscriber-initiated (ADR-0002): for each reliable topic this
+     * node subscribes to, ensure a StreamParticipants connection to each
+     * current publisher (first advertised endpoint), re-dialing on break.
+     * Called automatically on each discovery cleanup; safe to call again.
+     */
+    void startReliableSubscriptions();
+
+    /**
+     * @brief Tears down all subscriber-client connections to publishers.
+     *
+     * Stops and joins each dialing thread. Also called by stopAutoDiscovery().
+     */
+    void stopReliableSubscriptions();
+
+    /**
+     * @brief Handles a ParticipantData frame read from a publisher's stream.
+     *
+     * Extracts a reliable DataMessage payload (reliable_data), applies the
+     * bounded exactly-once reorder/dedup window per (publisher uid, topic),
+     * then dispatches to the local callbacks. Presence frames (empty
+     * reliable_data) are ignored. Internal, called by ReliableSubscriberConnection.
+     */
+    void handleReliableDataFrame(const autoDiscovery::ParticipantData& pd);
+
     // ========================================================================
     // Public API: Topic Registration (C++20 templates)
     // Declarations only; template definitions are at the end of this header.
     // ========================================================================
     template<typename T> requires Topic<T>
-    bool registerPublisherTopic(const std::string& topicName);
+    bool registerPublisherTopic(const std::string& topicName, bool reliable = false);
 
     template<typename T> requires Topic<T>
     bool unregisterPublisherTopic(const std::string& topicName);
 
     template<typename T> requires Topic<T>
-    bool registerSubscriberTopic(const std::string& topicName);
+    bool registerSubscriberTopic(const std::string& topicName, bool reliable = false);
 
     template<typename T> requires Topic<T>
     bool registerSubscriberTopic(const std::string& topicName,
-                                 std::function<void(const T&)> callback);
+                                 std::function<void(const T&)> callback,
+                                 bool reliable = false);
 
     /**
      * @brief Subscribes with a typed callback to an already-registered topic
@@ -560,7 +652,7 @@ public:
  * @return true if registration succeeded
  */
 template<typename T> requires Topic<T>
-bool Edriel::registerPublisherTopic(const std::string& topicName) {
+bool Edriel::registerPublisherTopic(const std::string& topicName, bool reliable) {
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
 
     {
@@ -570,6 +662,7 @@ bool Edriel::registerPublisherTopic(const std::string& topicName) {
         TopicEntry& entry = topicRegistry[topicInfo.key];
         entry.topicName = topicName;
         entry.messageType = topicInfo.messageType;
+        entry.reliable = reliable;
     }
 
     // Announce our publishing interest via the existing discovery path.
@@ -580,8 +673,10 @@ bool Edriel::registerPublisherTopic(const std::string& topicName) {
     ad.mutable_topic()->set_topic_name(topicName);
     ad.mutable_topic()->set_message_type(topicInfo.messageType);
     ad.mutable_topic()->set_is_publisher(true);
+    ad.mutable_topic()->set_reliable(reliable);
 
-    std::cout << "[Edriel] Registered publisher topic: " << topicName << "\n";
+    std::cout << "[Edriel] Registered publisher topic: " << topicName
+              << (reliable ? " (reliable)" : "") << "\n";
     return sendPacket(ad);
 }
 
@@ -627,7 +722,7 @@ bool Edriel::unregisterPublisherTopic(const std::string& topicName) {
  * @return true if registration succeeded
  */
 template<typename T> requires Topic<T>
-bool Edriel::registerSubscriberTopic(const std::string& topicName) {
+bool Edriel::registerSubscriberTopic(const std::string& topicName, bool reliable) {
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
 
     {
@@ -635,6 +730,10 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName) {
         TopicEntry& entry = topicRegistry[topicInfo.key];
         entry.topicName = topicName;
         entry.messageType = topicInfo.messageType;
+        entry.reliable = reliable;
+        if (reliable) {
+            reliableSubscribedTopics_.insert(topicInfo.key);
+        }
     }
 
     autoDiscovery::TopicAdvertisement ad;
@@ -644,8 +743,10 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName) {
     ad.mutable_topic()->set_topic_name(topicName);
     ad.mutable_topic()->set_message_type(topicInfo.messageType);
     ad.mutable_topic()->set_is_publisher(false);
+    ad.mutable_topic()->set_reliable(reliable);
 
-    std::cout << "[Edriel] Registered subscriber topic: " << topicName << "\n";
+    std::cout << "[Edriel] Registered subscriber topic: " << topicName
+              << (reliable ? " (reliable)" : "") << "\n";
     return sendPacket(ad);
 }
 
@@ -663,7 +764,8 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName) {
  */
 template<typename T> requires Topic<T>
 bool Edriel::registerSubscriberTopic(const std::string& topicName,
-                                     std::function<void(const T&)> callback) {
+                                     std::function<void(const T&)> callback,
+                                     bool reliable) {
     if (!callback) {
         return false;
     }
@@ -675,6 +777,10 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName,
         TopicEntry& entry = topicRegistry[topicInfo.key];
         entry.topicName = topicName;
         entry.messageType = topicInfo.messageType;
+        entry.reliable = reliable;
+        if (reliable) {
+            reliableSubscribedTopics_.insert(topicInfo.key);
+        }
 
         TopicEntry::Callback erased;
         erased.messageType = topicInfo.messageType;
@@ -685,8 +791,8 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName,
     }
 
     std::cout << "[Edriel] Registered subscriber topic with callback: "
-              << topicName << "\n";
-    return registerSubscriberTopic<T>(topicName);
+              << topicName << (reliable ? " (reliable)" : "") << "\n";
+    return registerSubscriberTopic<T>(topicName, reliable);
 }
 
 /**
@@ -752,6 +858,7 @@ bool Edriel::unregisterSubscriberTopic(const std::string& topicName) {
     // Remove all local callbacks for this topic; keep the entry only if it
     // still tracks remote peers (registry bookkeeping for discovery).
     it->second.callbacks.clear();
+    reliableSubscribedTopics_.erase(key);
     if (it->second.publishers.empty() && it->second.subscribers.empty()) {
         topicRegistry.erase(it);
     }
@@ -784,7 +891,24 @@ bool Edriel::sendMessage(const std::string& topicName, const T& message) {
                   << topicName << "\n";
         return false;
     }
-    return publishData(topicName, std::string(T::descriptor()->full_name()), payload);
+
+    const std::string messageType = std::string(T::descriptor()->full_name());
+
+    // QoS routing: reliable topics go over the gRPC path (unicast, exactly-
+    // once), best-effort topics stay on multicast exactly as before.
+    bool reliable = false;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        const auto it = topicRegistry.find(makeCompositeKey(topicName, messageType));
+        if (it != topicRegistry.end() && it->second.reliable) {
+            reliable = true;
+        }
+    }
+
+    if (reliable) {
+        return publishReliable(topicName, messageType, payload);
+    }
+    return publishData(topicName, messageType, payload);
 }
 
 } // namespace edriel

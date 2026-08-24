@@ -8,12 +8,14 @@
 
 #include "Edriel.hpp"
 #include "EdrielGrpcService.hpp"
+#include "EdrielReliableClient.hpp"
 #include <asio/steady_timer.hpp>
 #include <google/protobuf/descriptor.h>
 #include <cstring>
 #include <iostream>
 #include <fstream>
 #include <random>
+#include <limits>
 
 #if defined(_WIN32)
 #include <process.h>
@@ -410,6 +412,9 @@ void Edriel::startAutoDiscoverySender() {
 void Edriel::startAutoDiscoveryCleaner() {
     postOnStrand([this] {
         removeTimedOutParticipants();  // Initial cleanup
+        // Reconcile subscriber-client connections: re-dial on participant /
+        // endpoint-set change, drop connections whose publisher left.
+        reconcileReliableConnections();
 
         autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanupPeriod());
         autoDiscoveryCleanUpTimer->async_wait(
@@ -800,7 +805,10 @@ void Edriel::stopAutoDiscovery() {
         asio::error_code ec;
         autoDiscoverySocket->close(ec);
     }
-    
+
+    // Tear down subscriber-client connections to publishers (reliable path).
+    stopReliableSubscriptions();
+
     // Drain the reliable-path gRPC server.
     stopGrpcServer();
 
@@ -891,6 +899,225 @@ std::vector<autoDiscovery::ParticipantData> Edriel::snapshotParticipantData() co
         presence.push_back(std::move(pd));
     }
     return presence;
+}
+
+// ============================================================================
+// Reliable send path (ADR-0002 M4/M5)
+// ============================================================================
+
+bool Edriel::publishReliable(const std::string& topicName,
+                             const std::string& messageType,
+                             const std::string& payload) {
+    if (!grpcService_) {
+        std::cerr << "[Edriel] Reliable send on '" << topicName
+                  << "' but no gRPC server is serving\n";
+        return false;
+    }
+
+    const std::string key = makeCompositeKey(topicName, messageType);
+
+    std::set<Participant> subscribers;
+    std::uint64_t seq = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        const auto it = topicRegistry.find(key);
+        if (it == topicRegistry.end() || it->second.subscribers.empty()) {
+            return false;  // no subscribers for this reliable topic
+        }
+        subscribers = it->second.subscribers;
+        seq = ++reliablePublisherSeq_[key];
+    }
+
+    // Stamp a per-(publisher, topic) tid (reusing Identifier.tid) so the
+    // receiver's reorder/dedup window can deliver exactly-once in order.
+    autoDiscovery::DataMessage data;
+    data.mutable_identifier()->set_pid(selfParticipant.pid);
+    data.mutable_identifier()->set_tid(seq);
+    data.mutable_identifier()->set_uid(selfParticipant.uid);
+    data.set_topic_name(topicName);
+    data.set_message_type(messageType);
+    data.set_payload(payload);
+
+    std::string serialized;
+    if (!data.SerializeToString(&serialized)) {
+        std::cerr << "[Edriel] Failed to serialize reliable frame\n";
+        return false;
+    }
+
+    // Same 1500-byte payload MTU budget as the multicast path (ADR-0002,
+    // fragmentation deferred): reject an oversized reliable frame at send time
+    // rather than delivering a truncated/gapped stream.
+    if (serialized.size() > recvBufferSize) {
+        std::cerr << "[Edriel] Reliable frame for '" << topicName << "' is "
+                  << serialized.size() << " bytes, exceeds "
+                  << recvBufferSize << "-byte MTU budget, dropping\n";
+        return false;
+    }
+
+    bool pushedAny = false;
+    for (const Participant& sub : subscribers) {
+        autoDiscovery::ParticipantData frame;
+        frame.set_reliable_data(serialized);
+        const SubscriberKey sk{static_cast<std::uint32_t>(sub.pid), sub.tid, sub.uid};
+        if (grpcService_->pushData(sk, std::move(frame))) {
+            pushedAny = true;
+        }
+    }
+    return pushedAny;
+}
+
+void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {
+    if (pd.reliable_data().empty()) {
+        return;  // presence / control frame
+    }
+
+    autoDiscovery::DataMessage data;
+    if (!data.ParseFromString(pd.reliable_data())) {
+        std::cerr << "[Edriel] Dropping undecodable reliable frame\n";
+        return;
+    }
+
+    const std::uint64_t pubUid = data.identifier().uid();
+    const std::uint64_t tid = data.identifier().tid();
+    const std::string winKey =
+        std::to_string(pubUid) + "|" + makeCompositeKey(data.topic_name(), data.message_type());
+
+    // Collect everything that becomes deliverable (this frame and any buffered
+    // out-of-order frames that now become contiguous) under the lock, then
+    // dispatch after releasing it so user callbacks may re-enter the API.
+    std::vector<autoDiscovery::DataMessage> toDispatch;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        ReliableRxWindow& w = reliableWindows_[winKey];
+
+        const auto deliver = [&](autoDiscovery::DataMessage& m) {
+            toDispatch.push_back(std::move(m));
+            // This frame (or a buffered one) is tid `w.nextExpected`: the next
+            // contiguous tid to deliver is now one past it.
+            if (w.nextExpected < std::numeric_limits<std::uint64_t>::max()) {
+                ++w.nextExpected;
+            }
+            // Flush buffered out-of-order frames. A tid gap is treated as a
+            // lost frame (no retransmission at this layer): we still deliver
+            // every distinct tid exactly-once, in ascending order, advancing
+            // `nextExpected` past each flushed tid (absorbing the hole) so a
+            // duplicate of an already-flushed frame is dropped.
+            while (!w.buffer.empty()) {
+                auto it = w.buffer.begin();
+                const std::uint64_t bufferedTid = it->first;
+                toDispatch.push_back(std::move(it->second));
+                w.buffer.erase(it);
+                w.nextExpected = std::max(w.nextExpected, bufferedTid);
+                if (w.nextExpected < std::numeric_limits<std::uint64_t>::max()) {
+                    ++w.nextExpected;
+                }
+            }
+        };
+
+        if (tid == w.nextExpected) {
+            deliver(data);
+        } else if (tid > w.nextExpected) {
+            if ((tid - w.nextExpected) < kReliableWindowSize) {
+                // Within the bounded window: hold for reordering. Bounded — if
+                // full, drop the incoming (a gap is unrecoverable anyway).
+                if (w.buffer.size() < kReliableWindowSize) {
+                    w.buffer.emplace(tid, std::move(data));
+                }
+            }
+            // else: gap beyond the window bound -> drop (stale/unrecoverable)
+        }
+        // tid < w.nextExpected -> duplicate or already delivered -> drop.
+    }
+
+    for (autoDiscovery::DataMessage& m : toDispatch) {
+        handleDataMessageReceive(m);
+    }
+}
+
+void Edriel::startReliableSubscriptions() {
+    reconcileReliableConnections();
+}
+
+void Edriel::stopReliableSubscriptions() {
+    std::lock_guard<std::mutex> lock(reliableConnMutex_);
+    for (auto& kv : reliableConnections_) {
+        kv.second->stop();
+    }
+    reliableConnections_.clear();
+}
+
+void Edriel::reconcileReliableConnections() {
+    // Snapshot the publishers we must dial for locally reliable subscriptions.
+    struct Target {
+        SubscriberKey key;
+        std::string endpoint;
+    };
+    std::vector<Target> needed;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        // Canonical endpoints live in the global `participants` set (AdR-0002:
+        // refreshed on every heartbeat). The topicRegistry stores bare snapshots
+        // without endpoints, so cross-reference by (pid,tid,uid) for the reachable
+        // candidates of each publisher we must dial.
+        const auto canonicalEndpoints =
+            [this](const Participant& snap) -> const std::vector<autoDiscovery::Endpoint>* {
+            for (const Participant& p : participants) {
+                if (p.pid == snap.pid && p.tid == snap.tid && p.uid == snap.uid) {
+                    return &p.endpoints;
+                }
+            }
+            return nullptr;
+        };
+        for (const std::string& topicKey : reliableSubscribedTopics_) {
+            const auto it = topicRegistry.find(topicKey);
+            if (it == topicRegistry.end()) {
+                continue;
+            }
+            for (const Participant& pub : it->second.publishers) {
+                const std::vector<autoDiscovery::Endpoint>* eps = canonicalEndpoints(pub);
+                if (eps == nullptr || eps->empty()) {
+                    continue;
+                }
+                const autoDiscovery::Endpoint& ep = eps->front();
+                needed.push_back(Target{
+                    {static_cast<std::uint32_t>(pub.pid), pub.tid, pub.uid},
+                    ep.address() + ":" + std::to_string(ep.port())});
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(reliableConnMutex_);
+
+    // Drop connections no longer needed (publisher left / topic unsubscribed).
+    for (auto it = reliableConnections_.begin(); it != reliableConnections_.end();) {
+        bool stillNeeded = false;
+        for (const Target& t : needed) {
+            if (t.key == it->first) {
+                stillNeeded = true;
+                break;
+            }
+        }
+        if (!stillNeeded) {
+            it->second->stop();
+            it = reliableConnections_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Dial publishers we are not yet connected to (connect-in-order, first
+    // advertised endpoint wins).
+    for (const Target& t : needed) {
+        if (reliableConnections_.count(t.key) != 0) {
+            continue;
+        }
+        auto conn = std::make_unique<ReliableSubscriberConnection>(
+            *this, t.key, t.endpoint,
+            static_cast<std::uint32_t>(selfParticipant.pid), selfParticipant.tid,
+            selfParticipant.uid);
+        conn->start();
+        reliableConnections_[t.key] = std::move(conn);
+    }
 }
 
 // ============================================================================

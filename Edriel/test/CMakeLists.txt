@@ -124,6 +124,21 @@ target_link_libraries(test_grpc_service PRIVATE
 
 add_test(NAME TestGrpcService COMMAND test_grpc_service)
 
+# test_reliable: ADR-0002 M4/M5 reliable send path (round-trip, reorder/dedup,
+# QoS routing)
+add_executable(test_reliable
+    test_reliable.cpp
+)
+
+target_compile_options(test_reliable PRIVATE ${EDRIEL_STRICT_FLAGS})
+
+target_link_libraries(test_reliable PRIVATE
+    EdrielLib
+    GTest::gtest_main
+)
+
+add_test(NAME TestReliable COMMAND test_reliable)
+
 # benchmark: Performance benchmarks
 add_executable(benchmark
     benchmark.cpp
