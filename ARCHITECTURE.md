@@ -100,7 +100,7 @@ struct Participant {
     std::chrono::steady_clock::time_point lastSeen;
     std::set<TopicInfo> publishedTopics;
     std::set<TopicInfo> subscribedTopics;
-    static constexpr std::chrono::seconds timeoutPeriod{10};
+    std::chrono::seconds timeout; // aliveness timeout, from Config
     // ... operators for set containment ...
 };
 ```
@@ -150,11 +150,13 @@ bool sendMessage(const std::string& topicName, const Topic& message);
 
 ### 6. Configuration Module (`EdrielConfig.hpp` / `EdrielConfig.cpp`)
 
-Loads and validates the runtime endpoint settings that previously were
-hardcoded (port `30002`, multicast group `239.255.0.1`):
+Loads and validates the runtime settings that previously were hardcoded
+(port `30002`, multicast group `239.255.0.1`, heartbeat send interval `2s`,
+participant aliveness timeout `10s`):
 
 **Responsibilities:**
-- Parse `config.yml` via yaml-cpp (`port` and `multicast_ip` keys)
+- Parse `config.yml` via yaml-cpp (`port`, `multicast_ip`,
+  `discovery_period_seconds`, `participant_timeout_seconds` keys)
 - Validate each key independently and strictly
 - Fall back to a key's historical default on any missing/invalid/unparseable value
 - Report (via `fellBackToDefaults`) when a default was substituted, for diagnostics
@@ -163,27 +165,31 @@ hardcoded (port `30002`, multicast group `239.255.0.1`):
 **Key Methods:**
 - `parsePort(value, fallback)`: strict decimal integer in `[1, 65535]`, else `fallback`
 - `parseMulticastAddress(value, fallback)`: strict dotted-quad IPv4 in `224.0.0.0..239.255.255.255`, else `fallback`
+- `parseDurationSeconds(value, fallback)`: strict positive integer seconds in
+  `[1, 86400]` (sane upper bound, 24 h), else `fallback`
 - `loadConfig(configPath = "config.yml")`: returns a `Config`; never throws on config content
 
 **Fallback Behavior:** each key is resolved independently — missing, malformed,
 or out-of-range values keep that key's default (`port` → `30002`,
-`multicastAddress` → `239.255.0.1`), and the `fellBackToDefaults` flag is set.
+`multicastAddress` → `239.255.0.1`, `discoverySendPeriod` → `2s`,
+`participantTimeout` → `10s`), and the `fellBackToDefaults` flag is set.
 The default `Edriel` constructor calls `loadConfig()`; the resolved values drive
-`multicastEndpoint` / `receiverEndpoint` and the multicast `join_group` call.
+`multicastEndpoint` / `receiverEndpoint`, the multicast `join_group` call, and
+the discovery send + cleanup timer cadences.
 
 ## Data Flow
 
 ### Discovery Flow
 ```
 0. Load config.yml and validate (per-key), falling back to defaults on invalid
-1. Timer fires (every 2s)
+1. Timer fires (every config discovery send period; default 2s)
 2. Create discovery message with own participant info
 3. Serialize to packet + prepend magic number
 4. Broadcast to multicast address (config-derived)
 5. Wait for responses
 6. Parse responses and register new participants
 7. Update participant heartbeats
-8. Remove timed-out participants (every 5s)
+8. Remove timed-out participants (cleanup cadence = timeout/2; default every 5s)
 ```
 
 ### Message Delivery Flow
@@ -214,10 +220,10 @@ Server:  Send final status on close
 | `discoveryPort` (config.yml `port`) | 30002 | Multicast port — overridable, falls back on invalid |
 | `multicastAddress` (config.yml `multicast_ip`) | 239.255.0.1 | Multicast group address — overridable, falls back on invalid |
 | `recvBufferSize` | 1500 | UDP buffer size |
-| `autoDiscoverySendPeriod` | 2s | Discovery heartbeat interval |
-| `autoDiscoveryCleanUpPeriod` | 5s | Cleanup timer interval |
+| `discoverySendPeriod` (config.yml `discovery_period_seconds`) | 2s | Discovery heartbeat interval — overridable, falls back on invalid |
+| `participantTimeout` (config.yml `participant_timeout_seconds`) | 10s | Participant aliveness timeout — overridable, falls back on invalid |
+| cleanup cadence (`max(timeout/2, 1s)`) | 5s | Participant cleanup timer interval (derived from the configured timeout) |
 | `magicNumber` | 0xED75E1ED | Packet integrity check |
-| `timeoutPeriod` | 10s | Participant timeout |
 
 ## CMake Build System
 
@@ -252,7 +258,7 @@ Edriel Instance
 ├── std::unique_ptr<steady_timer> autoDiscoveryCleanUpTimer
 ├── asio::ip::udp::endpoint multicastEndpoint  // config-derived (multicastAddress:port)
 ├── asio::ip::udp::endpoint receiverEndpoint   // config-derived (any:port)
-├── edriel::Config config_                     // parsed runtime config (port + multicast group)
+├── edriel::Config config_                     // parsed runtime config (port + multicast + cadence)
 ├── autoDiscovery::Message discoveryMessage
 ├── std::string discoveryPacket
 ├── std::atomic_bool isRunning

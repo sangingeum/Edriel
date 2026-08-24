@@ -117,9 +117,8 @@ public:
         mutable std::chrono::steady_clock::time_point lastSeen;  ///< Last heartbeat time
         std::set<TopicInfo> publishedTopics;   ///< Topics this participant publishes
         std::set<TopicInfo> subscribedTopics;  ///< Topics this participant subscribes to
-        
-        static constexpr std::chrono::seconds timeoutPeriod{ 10 };  ///< Heartbeat timeout
-        
+        std::chrono::seconds timeout = std::chrono::seconds(10);  ///< Aliveness timeout (from Config)
+
         /**
          * @brief Constructs Participant with timestamps
          * @param p Participant ID
@@ -129,20 +128,33 @@ public:
         Participant(unsigned long p, uint64_t t, uint64_t u)
             : pid(p), tid(t), uid(u), 
               lastSeen(std::chrono::steady_clock::now()) {}
-        
+
+        /**
+         * @brief Constructs Participant with an explicit aliveness timeout
+         * @param p Participant ID
+         * @param t Transaction ID
+         * @param u Unique ID
+         * @param alivenessTimeout Seconds before the participant is dropped
+         */
+        Participant(unsigned long p, uint64_t t, uint64_t u,
+                    std::chrono::seconds alivenessTimeout)
+            : pid(p), tid(t), uid(u), 
+              lastSeen(std::chrono::steady_clock::now()),
+              timeout(alivenessTimeout) {}
+
         /**
          * @brief Default constructor
          */
         Participant()
             : pid(0), tid(0), uid(0),
               lastSeen(std::chrono::steady_clock::now()) {}
-        
+
         /**
          * @brief Checks if participant should be removed due to timeout
          * @return true if timeout has elapsed since last heartbeat
          */
         bool shouldBeRemoved() const {
-            return (std::chrono::steady_clock::now() - lastSeen) > timeoutPeriod;
+            return (std::chrono::steady_clock::now() - lastSeen) > timeout;
         }
         
         /**
@@ -176,8 +188,11 @@ private:
     // Configuration Constants
     // ========================================================================
     static constexpr std::size_t recvBufferSize{ 1500 };  ///< UDP receive buffer size
-    static constexpr std::chrono::seconds autoDiscoverySendPeriod{ 2 };     ///< Send heartbeat interval
-    static constexpr std::chrono::seconds autoDiscoveryCleanUpPeriod{ 5 };  ///< Cleanup interval
+    
+    // The discovery send period and cleanup interval are not hardcoded here:
+    // the send period is read from Config.discoverySendPeriod (config.yml
+    // `discovery_period_seconds`) and the cleanup interval is derived from the
+    // configured participant timeout (see autoDiscoveryCleanupPeriod()).
     
     using Buffer = std::array<char, recvBufferSize>;  ///< Buffer type for message serialization
     
@@ -297,6 +312,15 @@ private:
      * @brief Starts periodic participant cleanup timer
      */
     void startAutoDiscoveryCleaner();
+
+    /**
+     * @brief Derived cleanup cadence (seconds), used to reschedule the
+     *        participant cleaner. Runs at timeout/2 (e.g. 10s timeout -> 5s
+     *        cleanup) so a stale participant is dropped shortly after its
+     *        timeout elapses, never below 1s.
+     * @return cleanup interval derived from the configured participant timeout
+     */
+    std::chrono::seconds autoDiscoveryCleanupPeriod() const;
     
     
     /**

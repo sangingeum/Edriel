@@ -2,10 +2,11 @@
 # Edriel runtime configuration
 # ============================================================================
 #
-# Auto-discovery uses UDP multicast. The group address and port are read here
-# at startup and fed into the multicast-send and local-bind endpoints.
+# Auto-discovery uses UDP multicast. The group address, port, heartbeat send
+# interval, and participant aliveness timeout are read here at startup and fed
+# into the multicast-send, local-bind, and timer endpoints.
 #
-# Both keys are optional. Each value is validated strictly per-key; when a
+# All keys are optional. Each value is validated strictly per-key; when a
 # value is missing, malformed, or out of range, the library silently falls
 # back to the built-in default rather than aborting, so a bad or missing
 # config.yml can never crash a node.
@@ -19,3 +20,15 @@ port: 30002
 #   - must parse as a valid IPv4 multicast address (first octet 224..239)
 #   - unparseable or non-multicast -> falls back to 239.255.0.1
 multicast_ip: 239.255.0.1
+
+# Discovery heartbeat send interval, in whole seconds.
+#   - must be a positive integer, capped at 86400 (24h) to reject pathological
+#   - non-numeric, 0, or above the cap -> falls back to 2
+discovery_period_seconds: 2
+
+# Participant aliveness timeout, in whole seconds: a peer whose last heartbeat
+# is older than this is dropped by the cleanup pass.
+#   - must be a positive integer, capped at 86400 (24h) to reject pathological
+#   - non-numeric, 0, or above the cap -> falls back to 10
+#   - the cleanup pass runs at timeout/2 (so a 10s timeout cleans every 5s)
+participant_timeout_seconds: 10

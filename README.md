@@ -45,27 +45,37 @@ Run benchmarks (latency + throughput over multicast loopback):
 
 ## Configuration (`config.yml`)
 
-The auto-discovery endpoint — the UDP port and the multicast group address —
-is read from a `config.yml` at the repository root (the process working
-directory). Both keys are optional; every value is validated strictly per-key,
-and a value that is missing, malformed, or out of range falls back silently to
-the built-in default rather than failing startup.
+The auto-discovery endpoint — the UDP port, the multicast group address — and
+its cadence (heartbeat send interval, participant aliveness timeout) are read
+from a `config.yml` at the repository root (the process working directory). All
+keys are optional; every value is validated strictly per-key, and a value that
+is missing, malformed, or out of range falls back silently to the built-in
+default rather than failing startup.
 
 ```yaml
 port: 30002
 multicast_ip: 239.255.0.1
+discovery_period_seconds: 2
+participant_timeout_seconds: 10
 ```
 
 | Key | Valid range | Falls back to |
 |-----|-------------|---------------|
 | `port` | integer in `1..65535` | `30002` |
 | `multicast_ip` | IPv4 multicast `224.0.0.0` .. `239.255.255.255` | `239.255.0.1` |
+| `discovery_period_seconds` | integer seconds in `1..86400` | `2` |
+| `participant_timeout_seconds` | integer seconds in `1..86400` | `10` |
 
 A missing, unreadable, or malformed `config.yml` behaves exactly like an
 invalid value: the defaults are used and no exception escapes. Because
 validation is per-key, a valid `port` is honored even when `multicast_ip` is
 bad (and vice-versa). YAML is parsed with yaml-cpp (added to the Conan
 dependencies).
+
+The participant cleanup pass isn't independently configurable: it is derived
+from the participant timeout so the two stay in step. Given a timeout of `T`
+seconds, the cleaner runs every `max(T/2, 1)` seconds — a 10 s timeout cleans
+every 5 s, matching the historical 5 s / 10 s ratio.
 
 The library constructor reads the file automatically:
 
@@ -75,9 +85,10 @@ edriel::Edriel edriel(io);              // loads config.yml (or the defaults)
 edriel::Edriel edrielCfg(io, config);   // explicit edriel::Config
 ```
 
-`edriel::Config` has `port`, `multicastAddress`, and a diagnostic
-`fellBackToDefaults` flag. The explicit-constructor overload lets a host
-application supply validated settings without a config file being present.
+`edriel::Config` has `port`, `multicastAddress`, `discoverySendPeriod`
+(`std::chrono::seconds`), `participantTimeout` (`std::chrono::seconds`), and a
+diagnostic `fellBackToDefaults` flag. The explicit-constructor overload lets a
+host application supply validated settings without a config file being present.
 
 ## Benchmark baseline
 
@@ -103,8 +114,9 @@ per message.
 ## Core concepts
 
 - **Participant discovery** — `startAutoDiscovery()` joins the multicast group,
-  broadcasts heartbeats every 2 s, and drops participants that stop heartbeating
-  for 10 s (the timeout is checked every 5 s).
+  broadcasts heartbeats every `discovery_period_seconds` (default 2 s), and
+  drops participants that stop heartbeating for `participant_timeout_seconds`
+  (default 10 s; the timeout is checked every `max(timeout/2, 1)` seconds).
 - **Topics** — a topic is a name plus a protobuf message type. A publisher and
   a subscriber connect only when both name and type match.
 - **Messages** — any protobuf message type works; you generate its C++ code

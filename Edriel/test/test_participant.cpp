@@ -27,7 +27,20 @@ TEST(TestParticipant, Timeout) {
     
     // Simulate timeout by setting lastSeen in the past
     p.lastSeen = std::chrono::steady_clock::now() - 
-                  (Edriel::Participant::timeoutPeriod + std::chrono::seconds(1));
+                  (p.timeout + std::chrono::seconds(1));
+    EXPECT_TRUE(p.shouldBeRemoved());
+}
+
+TEST(TestParticipant, CustomTimeout) {
+    // The aliveness timeout is stored per-participant (from Config), so the
+    // 3-arg constructor defaults to 10s and the 4-arg one honors the value.
+    Edriel::Participant p(123, 456, 789, std::chrono::seconds(3));
+    EXPECT_EQ(p.timeout, std::chrono::seconds(3));
+    // A heartbeat 2s old is still alive under a 3s timeout...
+    p.lastSeen = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+    EXPECT_FALSE(p.shouldBeRemoved());
+    // ...but 4s old is past the timeout.
+    p.lastSeen = std::chrono::steady_clock::now() - std::chrono::seconds(4);
     EXPECT_TRUE(p.shouldBeRemoved());
 }
 

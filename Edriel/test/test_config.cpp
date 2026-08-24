@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>      // std::chrono::seconds
 #include <cstdio>      // std::remove
 #include <filesystem>  // std::filesystem
 #include <fstream>     // std::ofstream
@@ -30,6 +31,8 @@ std::filesystem::path writeTempConfig(const std::string& content) {
 
 constexpr uint16_t kDefaultPort = 30002;
 const std::string kDefaultMc = "239.255.0.1";
+const std::chrono::seconds kDefaultDiscovery = edriel::kDefaultDiscoverySendPeriod;
+const std::chrono::seconds kDefaultTimeout = edriel::kDefaultParticipantTimeout;
 
 }  // namespace
 
@@ -84,6 +87,30 @@ TEST(ParseMulticastAddress, RejectsUnparseable) {
     EXPECT_EQ(edriel::parseMulticastAddress("239.255.00.1"), kDefaultMc);  // leading zero
 }
 
+// --- parseDurationSeconds --------------------------------------------------
+
+TEST(ParseDurationSeconds, AcceptsValidRange) {
+    const std::chrono::seconds sentinel(0);  // 0 is never valid -> distinguishes
+    EXPECT_EQ(edriel::parseDurationSeconds("1", sentinel), std::chrono::seconds(1));
+    EXPECT_EQ(edriel::parseDurationSeconds("2", sentinel), std::chrono::seconds(2));
+    EXPECT_EQ(edriel::parseDurationSeconds("10", sentinel), std::chrono::seconds(10));
+    EXPECT_EQ(edriel::parseDurationSeconds("86400", sentinel), std::chrono::seconds(86400));
+}
+
+TEST(ParseDurationSeconds, FallsBackOnInvalid) {
+    const std::chrono::seconds fallback(99);
+    EXPECT_EQ(edriel::parseDurationSeconds("", fallback), fallback);              // empty
+    EXPECT_EQ(edriel::parseDurationSeconds("abc", fallback), fallback);           // non-numeric
+    EXPECT_EQ(edriel::parseDurationSeconds("0", fallback), fallback);             // zero/<=0
+    EXPECT_EQ(edriel::parseDurationSeconds("-2", fallback), fallback);            // negative
+    EXPECT_EQ(edriel::parseDurationSeconds("86401", fallback), fallback);         // above sane cap
+    EXPECT_EQ(edriel::parseDurationSeconds("10x", fallback), fallback);           // trailing junk
+    EXPECT_EQ(edriel::parseDurationSeconds(" 10", fallback), fallback);           // leading whitespace
+    EXPECT_EQ(edriel::parseDurationSeconds("10 ", fallback), fallback);           // trailing whitespace
+    EXPECT_EQ(edriel::parseDurationSeconds("99999999999999999999", fallback),
+              fallback);  // overflow
+}
+
 // --- loadConfig ------------------------------------------------------------
 
 TEST(LoadConfig, MissingFileYieldsDefaults) {
@@ -99,11 +126,15 @@ TEST(LoadConfig, MissingFileYieldsDefaults) {
 TEST(LoadConfig, ParsesValidFile) {
     const auto path = writeTempConfig(
         "port: 40001\n"
-        "multicast_ip: 224.0.0.10\n");
+        "multicast_ip: 224.0.0.10\n"
+        "discovery_period_seconds: 3\n"
+        "participant_timeout_seconds: 12\n");
 
     const edriel::Config cfg = edriel::loadConfig(path.string());
     EXPECT_EQ(cfg.port, 40001);
     EXPECT_EQ(cfg.multicastAddress, "224.0.0.10");
+    EXPECT_EQ(cfg.discoverySendPeriod, std::chrono::seconds(3));
+    EXPECT_EQ(cfg.participantTimeout, std::chrono::seconds(12));
     EXPECT_FALSE(cfg.fellBackToDefaults);
 }
 
@@ -125,6 +156,32 @@ TEST(LoadConfig, MissingKeyKeepsDefaultForThatKey) {
     const edriel::Config cfg = edriel::loadConfig(path.string());
     EXPECT_EQ(cfg.port, 48000);                     // present key read
     EXPECT_EQ(cfg.multicastAddress, kDefaultMc);    // absent key -> default
+    EXPECT_EQ(cfg.discoverySendPeriod, kDefaultDiscovery);   // absent -> default
+    EXPECT_EQ(cfg.participantTimeout, kDefaultTimeout);      // absent -> default
+    EXPECT_TRUE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, DurationKeysFallBackPerKey) {
+    // Only the discovery period is invalid -> the timeout stays honored.
+    const auto path = writeTempConfig(
+        "discovery_period_seconds: 0\n"
+        "participant_timeout_seconds: 30\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.discoverySendPeriod, kDefaultDiscovery);  // 0 -> default
+    EXPECT_EQ(cfg.participantTimeout, std::chrono::seconds(30));  // valid -> kept
+    EXPECT_TRUE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, DurationKeysRejectOutOfRange) {
+    // A value above the sane cap falls back to the default for that key.
+    const auto path = writeTempConfig(
+        "discovery_period_seconds: 86401\n"
+        "participant_timeout_seconds: 15\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.discoverySendPeriod, kDefaultDiscovery);  // > cap -> default
+    EXPECT_EQ(cfg.participantTimeout, std::chrono::seconds(15));  // valid -> kept
     EXPECT_TRUE(cfg.fellBackToDefaults);
 }
 

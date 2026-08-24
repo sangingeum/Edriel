@@ -171,10 +171,10 @@ Edriel::~Edriel() {
  */
 void Edriel::initializeAutoDiscovery() {
     // Start send timer
-    autoDiscoverySendTimer->expires_after(autoDiscoverySendPeriod);
+    autoDiscoverySendTimer->expires_after(config_.discoverySendPeriod);
     
     // Start cleanup timer
-    autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanUpPeriod);
+    autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanupPeriod());
     
     // Start receivers
     startAutoDiscoveryReceiver();
@@ -227,7 +227,7 @@ void Edriel::postOnStrand(std::function<void()> thunk) {
 /**
  * @brief Starts periodic discovery message sender
  * 
- * Every autoDiscoverySendPeriod seconds (default 2s), sends a discovery
+ * Every config_.discoverySendPeriod seconds (default 2s), sends a discovery
  * heartbeat packet containing our participant information to the multicast group.
  * 
  * The whole send-rearm cycle runs on the strand so the shared socket and the
@@ -253,7 +253,7 @@ void Edriel::startAutoDiscoverySender() {
                     }
 
                     // Schedule next send
-                    autoDiscoverySendTimer->expires_after(autoDiscoverySendPeriod);
+                    autoDiscoverySendTimer->expires_after(config_.discoverySendPeriod);
                     autoDiscoverySendTimer->async_wait(
                         asio::bind_executor(strand,
                             [this](const asio::error_code& ec) {
@@ -268,14 +268,15 @@ void Edriel::startAutoDiscoverySender() {
 /**
  * @brief Starts periodic participant cleanup timer
  * 
- * Every autoDiscoveryCleanUpPeriod seconds (default 5s), checks which participants
+ * Every autoDiscoveryCleanupPeriod() seconds (default 5s, derived as
+ * timeout/2 from the configured participant timeout), checks which participants
  * have timed out and removes them from the registry.
  */
 void Edriel::startAutoDiscoveryCleaner() {
     postOnStrand([this] {
         removeTimedOutParticipants();  // Initial cleanup
 
-        autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanUpPeriod);
+        autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanupPeriod());
         autoDiscoveryCleanUpTimer->async_wait(
             asio::bind_executor(strand,
                 [this](const asio::error_code& ec) {
@@ -284,6 +285,21 @@ void Edriel::startAutoDiscoveryCleaner() {
                     }
                 }));
     });
+}
+
+/**
+ * @brief Derived participant cleanup cadence (seconds).
+ *
+ * The cleanup interval is not a separate config key: it is derived from the
+ * configured participant alive timeout so that the two stay in step. A
+ * participant is dropped when the timeout has elapsed; the cleaner then runs
+ * at timeout/2 so no stale participant lingers much past its timeout. Never
+ * below 1s (guards the degenerate case of a 1s timeout).
+ */
+std::chrono::seconds Edriel::autoDiscoveryCleanupPeriod() const {
+    const std::chrono::seconds halfTimeout = config_.participantTimeout / 2;
+    return halfTimeout >= std::chrono::seconds(1) ? halfTimeout
+                                                   : std::chrono::seconds(1);
 }
 
 // ============================================================================
@@ -374,8 +390,8 @@ void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_
         });
     
     if (it == participants.end()) {
-        // New participant, create entry
-        Participant newParticipant(pid, tid, uid);
+        // New participant, create entry with the configured aliveness timeout.
+        Participant newParticipant(pid, tid, uid, config_.participantTimeout);
         
         // Set initial timestamp
         newParticipant.lastSeen = std::chrono::steady_clock::now();
