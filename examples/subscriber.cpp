@@ -17,14 +17,15 @@ int main()
     asio::io_context io;
     edriel::Edriel edriel(io);
 
+    std::function<void(const robot::Telemetry&)> onTelemetry =
+        [](const robot::Telemetry& telemetry) {
+            std::cout << "[example-sub] telemetry from node "
+                      << telemetry.node_id()
+                      << ": battery=" << telemetry.battery_voltage()
+                      << "V rpm=" << telemetry.wheel_rpm() << "\n";
+        };
     if (!edriel.registerSubscriberTopic<robot::Telemetry>(
-            "telemetry",
-            [](const robot::Telemetry& telemetry) {
-                std::cout << "[example-sub] telemetry from node "
-                          << telemetry.node_id()
-                          << ": battery=" << telemetry.battery_voltage()
-                          << "V rpm=" << telemetry.wheel_rpm() << "\n";
-            })) {
+            "telemetry", onTelemetry)) {
         std::cerr << "[example-sub] failed to subscribe to topic\n";
         return 1;
     }

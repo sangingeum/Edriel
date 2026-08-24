@@ -163,6 +163,56 @@ bool unregisterSubscriberTopic<T>(const std::string& topicName);
 `T` must be a protobuf message type (constrained by the `Topic` concept).
 All registration/send functions return `false` on failure.
 
+## Reliable QoS (ADR-0002)
+
+By default topics are **best-effort**: `sendMessage()` writes one multicast
+datagram and makes no delivery guarantee. A topic opted into **reliable** QoS
+instead carries its traffic over a gRPC unicast path between each subscriber
+and the publisher — ordered, exactly-once per (publisher, topic), and
+backpressured to the data source.
+
+Opt a topic in by passing `reliable = true` (default `false`) when
+registering:
+
+```cpp
+// Publisher side: this node serves "status" reliably.
+edriel.registerPublisherTopic<robot::Telemetry>("status", /*reliable=*/true);
+
+// Subscriber side: this node dials the publisher(s) of "status" and receives
+// exactly-once, in-order frames delivered to the callback.
+edriel.registerSubscriberTopic<robot::Telemetry>(
+    "status",
+    [](const robot::Telemetry& msg) { /* ... */ },
+    /*reliable=*/true);
+```
+
+All other topics stay on the multicast path exactly as before. A best-effort
+topic and a reliable topic with the same name/type are distinct in the
+registry, so the two QoS classes do not interfere.
+
+How it works (subscriber-initiated, per ADR-0002):
+
+- Every node runs **one small gRPC `ParticipantStreamService`** on `grpc_port`
+  (default 4000). It serves the topics *it* publishes reliably.
+- Each node *also* dials the publishers of topics it subscribes to with
+  `reliable = true`, opening a bidi `StreamParticipants` stream per publisher.
+  On that stream the publisher pushes `ParticipantData` frames whose
+  `reliable_data` carries one serialized `DataMessage` per sent message,
+  stamped with a per-(publisher, topic) `tid`.
+- The subscriber keeps a bounded reorder/dedup window per (publisher, topic),
+  delivering each distinct `tid` exactly-once in ascending order.
+- Dialing endpoints come from the multicast heartbeat (`Identifier.endpoints`,
+  Channel A), refreshed every heartbeat; a publisher that times out is dropped
+  and its stream torn down. `GetParticipantInfo` (unary) is available as a
+  post-connect verifier/refresher (Channel C).
+
+The reliable path honors the same ~1500-byte payload MTU budget as
+best-effort; larger payloads are rejected at send time (fragmentation is
+deferred — split large reliable messages app-side).
+
+Related config keys are documented above (`grpc_port`,
+`advertise_address`, `max_advertised_endpoints`).
+
 ## Custom messages: using your own `.proto` files
 
 You write your message types yourself; Edriel compiles them into C++ and lets
