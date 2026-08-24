@@ -23,17 +23,40 @@ message DataMessage {
   bytes payload = 4;           // serialized user message
 }
 
+// Unicast reachable endpoint the owner of the associated participant serves
+// its gRPC ParticipantStreamService on. Advertised on the multicast heartbeat
+// (Channel A) so reliable streams can be opened as soon as a peer is
+// discovered. Candidates are tried in order, first-wins. Kept small and
+// strictly bounded by the config max_advertised_endpoints cap.
+message Endpoint {
+  string address = 1;   // IPv4/IPv6 literal or hostname
+  uint32  port    = 2;  // gRPC TCP listener port
+  enum Transport {
+    TRANSPORT_UNSPECIFIED = 0;
+    GRPC_TCP = 1;       // the only transport today
+  }
+  Transport transport = 3;  // reserved for future (TLS, QUIC, ...)
+}
+
 message Identifier {
   uint32 pid = 1;
   uint64 tid = 2;
   uint64 uid = 3;
+  // Unicast connectivity endpoints for this participant's gRPC server. Rides
+  // the 2s heartbeat (Channel A in ADR-0002); ADDITIVE proto3 field, old
+  // nodes silently ignore it. Cap a handful of candidates so the heartbeat
+  // datagram cannot balloon.
+  repeated Endpoint endpoints = 4;
 }
 
 message Topic {
   string topic_name = 1; // user-defined topic name
   string message_type = 2; // protobuf message full name
   bool is_publisher = 3; // true if publisher, false if subscriber
-  // TODO: QOS policies
+  // true = reliable QoS: carry this topic's traffic over the gRPC path
+  // (unicast, exactly-once per (pub, topic)); false = best-effort multicast
+  // as always. The QOS TODO, resolved: best-effort stays on multicast.
+  bool reliable = 4;
 }
 
 message TopicAdvertisement {

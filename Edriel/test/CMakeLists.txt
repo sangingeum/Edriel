@@ -95,6 +95,20 @@ target_link_libraries(test_config PRIVATE
 
 add_test(NAME TestConfig COMMAND test_config)
 
+# test_endpoint: ADR-0002 Endpoint / endpoints / reliable proto wire tests
+add_executable(test_endpoint
+    test_endpoint.cpp
+)
+
+target_compile_options(test_endpoint PRIVATE ${EDRIEL_STRICT_FLAGS})
+
+target_link_libraries(test_endpoint PRIVATE
+    EdrielLib
+    GTest::gtest_main
+)
+
+add_test(NAME TestEndpoint COMMAND test_endpoint)
+
 # benchmark: Performance benchmarks
 add_executable(benchmark
     benchmark.cpp

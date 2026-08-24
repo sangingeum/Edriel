@@ -1,5 +1,9 @@
 syntax = "proto3";
 
+// Endpoints shared with the multicast plane (Channel A / ADR-0002) for
+// reliable-stream reachability. Compiled in the same package/source dir.
+import "autoDiscovery.proto";
+
 package autoDiscovery;
 
 // gRPC service for participant data streaming
@@ -28,9 +32,13 @@ message ParticipantData {
   uint32 pid = 1;
   uint64 tid = 2;
   uint64 uid = 3;
-  string endpoint = 4;  // gRPC endpoint address
+  string endpoint = 4;  // gRPC endpoint address (legacy, kept for back-compat)
   string status = 5;  // online/offline/timedout
   repeated string topics_published = 6;
   repeated string topics_subscribed = 7;
+  // Rich unicast endpoints, same shape as the multicast heartbeat carries.
+  // ADDITIVE proto3 field (field 8); old peers ignore it. Multiple candidates
+  // express multi-homed reachability; try in order, first-wins.
+  repeated Endpoint endpoints = 8;
   // TODO: Add capability flags (supports streaming, etc.)
 }
