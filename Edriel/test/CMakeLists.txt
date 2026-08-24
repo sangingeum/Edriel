@@ -109,6 +109,21 @@ target_link_libraries(test_endpoint PRIVATE
 
 add_test(NAME TestEndpoint COMMAND test_endpoint)
 
+# test_grpc_service: ADR-0002 M3 reliable gRPC server (GetParticipantInfo +
+# StreamParticipants presence) driven by an in-process client
+add_executable(test_grpc_service
+    test_grpc_service.cpp
+)
+
+target_compile_options(test_grpc_service PRIVATE ${EDRIEL_STRICT_FLAGS})
+
+target_link_libraries(test_grpc_service PRIVATE
+    EdrielLib
+    GTest::gtest_main
+)
+
+add_test(NAME TestGrpcService COMMAND test_grpc_service)
+
 # benchmark: Performance benchmarks
 add_executable(benchmark
     benchmark.cpp

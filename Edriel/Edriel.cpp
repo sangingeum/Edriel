@@ -7,6 +7,7 @@
  */
 
 #include "Edriel.hpp"
+#include "EdrielGrpcService.hpp"
 #include <asio/steady_timer.hpp>
 #include <google/protobuf/descriptor.h>
 #include <cstring>
@@ -300,6 +301,11 @@ void Edriel::initializeAutoDiscovery() {
     startAutoDiscoveryReceiver();
     startAutoDiscoverySender();
     startAutoDiscoveryCleaner();
+
+    // Bring up the reliable-path gRPC server so peers can dial this node's
+    // advertised endpoints (ADR-0002). Additive; a port conflict is logged and
+    // the multicast plane is unaffected.
+    startGrpcServer();
     
     // Set running flag
     isRunning = true;
@@ -795,7 +801,96 @@ void Edriel::stopAutoDiscovery() {
         autoDiscoverySocket->close(ec);
     }
     
+    // Drain the reliable-path gRPC server.
+    stopGrpcServer();
+
     std::cout << "[Edriel] Auto-discovery stopped\n";
+}
+
+// ============================================================================
+// Public API: Reliable gRPC path (ADR-0002)
+// ============================================================================
+
+void Edriel::startGrpcServer() {
+    if (grpcServer_) {
+        return;  // already serving
+    }
+
+    grpcService_ = std::make_unique<ParticipantStreamServiceImpl>(*this);
+
+    grpc::ServerBuilder builder;
+    const std::string address = "0.0.0.0:" + std::to_string(config_.grpcPort);
+    builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+    builder.RegisterService(grpcService_.get());
+
+    grpcServer_ = builder.BuildAndStart();
+    if (!grpcServer_) {
+        std::cerr << "[Edriel] Reliable gRPC server failed to start on "
+                  << address << "; multicast continues\n";
+        grpcService_.reset();
+        return;
+    }
+    std::cout << "[Edriel] Reliable gRPC server listening on " << address << "\n";
+}
+
+void Edriel::stopGrpcServer() {
+    if (grpcServer_) {
+        grpcServer_->Shutdown();  // reject new RPCs, cancel in-flight streams
+        grpcServer_->Wait();      // drain before teardown
+        grpcServer_.reset();
+        grpcService_.reset();
+        std::cout << "[Edriel] Reliable gRPC server stopped\n";
+    }
+}
+
+bool Edriel::lookupParticipantData(std::uint32_t pid, std::uint64_t tid,
+                                   std::uint64_t uid,
+                                   autoDiscovery::ParticipantData& out) const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    const auto it = std::find_if(
+        participants.begin(), participants.end(),
+        [pid, tid, uid](const Participant& p) {
+            return p.pid == pid && p.tid == tid && p.uid == uid;
+        });
+    if (it == participants.end()) {
+        return false;
+    }
+
+    out.set_pid(pid);
+    out.set_tid(tid);
+    out.set_uid(uid);
+    out.set_status("online");
+    for (const auto& ep : it->endpoints) {
+        *out.add_endpoints() = ep;
+    }
+    for (const auto& kv : topicRegistry) {
+        const TopicEntry& entry = kv.second;
+        if (entry.publishers.count(*it) != 0) {
+            out.add_topics_published(entry.topicName);
+        }
+        if (entry.subscribers.count(*it) != 0) {
+            out.add_topics_subscribed(entry.topicName);
+        }
+    }
+    return true;
+}
+
+std::vector<autoDiscovery::ParticipantData> Edriel::snapshotParticipantData() const {
+    std::vector<autoDiscovery::ParticipantData> presence;
+    std::lock_guard<std::mutex> lock(stateMutex);
+    presence.reserve(participants.size());
+    for (const Participant& p : participants) {
+        autoDiscovery::ParticipantData pd;
+        pd.set_pid(static_cast<std::uint32_t>(p.pid));
+        pd.set_tid(p.tid);
+        pd.set_uid(p.uid);
+        pd.set_status("online");
+        for (const auto& ep : p.endpoints) {
+            *pd.add_endpoints() = ep;
+        }
+        presence.push_back(std::move(pd));
+    }
+    return presence;
 }
 
 // ============================================================================

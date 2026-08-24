@@ -49,6 +49,10 @@ inline std::string makeCompositeKey(const std::string& topicName,
  */
 constexpr uint32_t MAGIC_NUMBER = 0xED75E1ED;
 
+// Forward declaration: the gRPC ParticipantStreamService server for the
+// reliable path (ADR-0002), implemented in EdrielGrpcService.{hpp,cpp}.
+class ParticipantStreamServiceImpl;
+
 // ============================================================================
 // Concept for protobuf message types used in topic registration/sending
 // ============================================================================
@@ -221,6 +225,11 @@ private:
     asio::ip::udp::endpoint multicastEndpoint;       ///< Multicast group endpoint
     asio::ip::udp::endpoint receiverEndpoint;       ///< Local bind endpoint for receiving discovery packets
     Config config_;                                  ///< Parsed runtime config (port + multicast group)
+
+    // Reliable-path gRPC server (ADR-0002): one small server per node, serving
+    // ParticipantStreamService on config_.grpcPort.
+    std::unique_ptr<grpc::Server> grpcServer_;
+    std::unique_ptr<ParticipantStreamServiceImpl> grpcService_;
     
     // ========================================================================
     // Discovery Message Buffer
@@ -450,6 +459,41 @@ public:
      * @brief Stops auto-discovery and cleans up resources
      */
     void stopAutoDiscovery();
+
+    // ========================================================================
+    // Public API: Reliable gRPC path (ADR-0002)
+    // ========================================================================
+    /**
+     * @brief Starts the reliable-path gRPC server on config_.grpcPort.
+     *
+     * Serves ParticipantStreamService (GetParticipantInfo + StreamParticipants)
+     * so subscribers can dial this node's advertised endpoints. Additive to the
+     * multicast plane; a port conflict logs a warning and leaves multicast
+     * untouched. Also started implicitly by startAutoDiscovery().
+     */
+    void startGrpcServer();
+
+    /**
+     * @brief Stops and drains the reliable-path gRPC server.
+     */
+    void stopGrpcServer();
+
+    /**
+     * @brief Builds the ParticipantData for a known participant identity.
+     *
+     * Internal accessor used by the gRPC service (Channel C verifier). Returns
+     * false when the identity is not in the registry.
+     */
+    bool lookupParticipantData(std::uint32_t pid, std::uint64_t tid, std::uint64_t uid,
+                               autoDiscovery::ParticipantData& out) const;
+
+    /**
+     * @brief Snapshot of every registered peer as ParticipantData (presence).
+     *
+     * Internal accessor used by the gRPC service to push discovery presence on
+     * a freshly-dialed StreamParticipants stream. Excludes the node itself.
+     */
+    std::vector<autoDiscovery::ParticipantData> snapshotParticipantData() const;
 
     // ========================================================================
     // Public API: Topic Registration (C++20 templates)
