@@ -3,6 +3,8 @@
 #include "autoDiscovery.pb.h"
 #include "autoDiscovery_grpc_service.pb.h"
 
+using edriel::Edriel;
+
 // ADR-0002 Milestone 1: additive proto3 Endpoint / endpoints / reliable tests.
 // The best-effort multicast path must stay byte-identical, so these focus on
 // the new wire fields round-tripping and on additive (back-compat) semantics.
@@ -114,4 +116,76 @@ TEST(TestEndpoint, TopicReliableRoundTrips) {
     Topic parsed;
     ASSERT_TRUE(parsed.ParseFromString(bytes));
     EXPECT_TRUE(parsed.reliable());
+}
+
+// --- Heartbeat endpoint populate (Milestone 2, Channel A) --------------------
+
+namespace {
+autoDiscovery::Message makeHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid,
+                                     const std::vector<std::pair<std::string, uint32_t>>& addrs) {
+    autoDiscovery::Message msg;
+    auto* id = msg.mutable_identifier();
+    id->set_pid(pid);
+    id->set_tid(tid);
+    id->set_uid(uid);
+    for (const auto& [address, port] : addrs) {
+        auto* ep = id->add_endpoints();
+        ep->set_address(address);
+        ep->set_port(port);
+        ep->set_transport(autoDiscovery::Endpoint::GRPC_TCP);
+    }
+    return msg;
+}
+}  // namespace
+
+TEST(TestEndpoint, HeartbeatPopulatesParticipantEndpoints) {
+    asio::io_context io;
+    Edriel edriel(io);
+
+    // A remote node's 2s heartbeat carrying two advertised unicast endpoints.
+    edriel.deliverForTest(makeHeartbeat(7, 9, 4242, {
+        {"192.168.1.5", 4000}, {"10.0.0.3", 4001},
+    }));
+
+    const auto& parts = edriel.participantsForTest();
+    ASSERT_EQ(parts.size(), 1u);
+    const Edriel::Participant& p = *parts.begin();
+    EXPECT_EQ(p.pid, 7u);
+    EXPECT_EQ(p.uid, 4242u);
+    ASSERT_EQ(p.endpoints.size(), 2u);
+    EXPECT_EQ(p.endpoints[0].address(), "192.168.1.5");
+    EXPECT_EQ(p.endpoints[0].port(), 4000u);
+    EXPECT_EQ(p.endpoints[1].address(), "10.0.0.3");
+    EXPECT_EQ(p.endpoints[1].port(), 4001u);
+}
+
+TEST(TestEndpoint, HeartbeatRefreshesParticipantEndpointsInPlace) {
+    asio::io_context io;
+    Edriel edriel(io);
+
+    // First heartbeat advertises endpoint A...
+    edriel.deliverForTest(makeHeartbeat(7, 424, 100, {{"192.168.1.5", 4000}}));
+    // ...then the same participant re-advertises from a moved interface: the
+    // vector must be overwritten in place (no second registry entry).
+    edriel.deliverForTest(makeHeartbeat(7, 424, 100, {{"10.9.8.7", 4005}}));
+
+    const auto& parts = edriel.participantsForTest();
+    ASSERT_EQ(parts.size(), 1u);  // still one participant
+    const Edriel::Participant& p = *parts.begin();
+    ASSERT_EQ(p.endpoints.size(), 1u);
+    EXPECT_EQ(p.endpoints[0].address(), "10.9.8.7");
+    EXPECT_EQ(p.endpoints[0].port(), 4005u);
+}
+
+TEST(TestEndpoint, HeartbeatWithoutEndpointsClearsList) {
+    asio::io_context io;
+    Edriel edriel(io);
+
+    edriel.deliverForTest(makeHeartbeat(7, 424, 100, {{"1.2.3.4", 4000}}));
+    // A subsequent heartbeat with no endpoints (legacy peer) clears the list.
+    edriel.deliverForTest(makeHeartbeat(7, 424, 100, {}));
+
+    const auto& parts = edriel.participantsForTest();
+    ASSERT_EQ(parts.size(), 1u);
+    EXPECT_TRUE(parts.begin()->endpoints.empty());
 }

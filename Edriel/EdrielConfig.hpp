@@ -16,6 +16,7 @@
 #include <chrono>    // std::chrono::seconds
 #include <cstdint>   // std::uint16_t
 #include <string>
+#include <vector>
 
 namespace edriel {
 
@@ -30,6 +31,14 @@ inline constexpr std::chrono::seconds kDefaultParticipantTimeout{ 10 };
 /// Sanity upper bound (seconds) for both configurable durations. A value
 /// above this is rejected as pathological and falls back to the default.
 inline constexpr std::chrono::seconds kMaxConfigurableDuration{ std::chrono::hours(24) };
+/// Default gRPC TCP listener port for the reliable ParticipantStreamService.
+/// Invalid/out-of-range -> 4000.
+inline constexpr std::uint16_t kDefaultGrpcPort{ 4000 };
+/// Default cap on advertised Endpoint candidates per heartbeat. Invalid/0 ->
+/// 4. Kept small so the heartbeat datagram cannot balloon (ADR-0002 MTU guard).
+inline constexpr std::size_t kDefaultMaxAdvertisedEndpoints{ 4 };
+/// Sanity ceiling for `max_advertised_endpoints` (avoids pathological growth).
+inline constexpr std::size_t kMaxAdvertisedEndpointsCap{ 64 };
 
 /**
  * @struct Config
@@ -47,6 +56,18 @@ struct Config {
     std::chrono::seconds discoverySendPeriod = kDefaultDiscoverySendPeriod;
     /// Participant aliveness timeout in seconds. Invalid/<=0 -> 10s.
     std::chrono::seconds participantTimeout = kDefaultParticipantTimeout;
+    /// gRPC TCP listener port this node serves its ParticipantStreamService on
+    /// (ADR-0002 reliable path). Advertised as the port of every self
+    /// Endpoint candidate. Invalid/out-of-range -> 4000.
+    std::uint16_t grpcPort = kDefaultGrpcPort;
+    /// Optional unicast addresses (multi-homed) to advertise in addition to
+    /// auto-discovered interfaces. Empty = advertise only discovered
+    /// interfaces. Cross-subnet / multicast-blind nodes set this so the
+    /// config seed (ADR-0002 Channel D) can still reach them.
+    std::vector<std::string> advertiseAddresses;
+    /// Cap on advertised Endpoint candidates per heartbeat (MTU guard).
+    /// Invalid/0 -> 4; clamped to kMaxAdvertisedEndpointsCap.
+    std::size_t maxAdvertisedEndpoints = kDefaultMaxAdvertisedEndpoints;
 
     /// True when one or more config.yml keys were missing or invalid and a
     /// default was substituted (diagnostics only). Also drives the
@@ -69,6 +90,15 @@ std::chrono::seconds parseDurationSeconds(const std::string& value,
 std::uint16_t parsePort(const std::string& value, std::uint16_t fallback = 30002);
 
 /**
+ * @brief Parse the advertised-endpoint cap. Returns `fallback` for anything
+ *        that is not a strict whole number in [1, kMaxAdvertisedEndpointsCap]
+ *        (0, overflow, non-numeric, above the sane ceiling). Clamps the
+ *        result to the ceiling.
+ */
+std::size_t parseMaxEndpoints(const std::string& value,
+                              std::size_t fallback = kDefaultMaxAdvertisedEndpoints);
+
+/**
  * @brief Parse an IPv4 multicast address. Returns `fallback` unless `value` is
  *        a strict dotted-quad address in the multicast range 224.0.0.0 .. 239.255.255.255.
  */
@@ -79,9 +109,12 @@ std::string parseMulticastAddress(const std::string& value,
  * @brief Load and validate config from a YAML file at `configPath`.
  *
  * Keys: `port` (integer), `multicast_ip` (string), `discovery_period_seconds`
- * (integer seconds), and `participant_timeout_seconds` (integer seconds). Each
- * missing or invalid key falls back to its default independently; a missing or
- * unparseable file also yields the defaults. Never throws on config content.
+ * (integer seconds), `participant_timeout_seconds` (integer seconds),
+ * `grpc_port` (integer; reliable-path listener), `advertise_address`
+ * (scalar or list of unicast addresses), and `max_advertised_endpoints`
+ * (integer cap). Each missing or invalid key falls back to its default
+ * independently; a missing or unparseable file also yields the defaults.
+ * Never throws on config content.
  */
 Config loadConfig(const std::string& configPath = "config.yml");
 

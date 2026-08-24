@@ -128,25 +128,38 @@ TEST(LoadConfig, ParsesValidFile) {
         "port: 40001\n"
         "multicast_ip: 224.0.0.10\n"
         "discovery_period_seconds: 3\n"
-        "participant_timeout_seconds: 12\n");
+        "participant_timeout_seconds: 12\n"
+        "grpc_port: 4700\n"
+        "advertise_address:\n"
+        "  - 10.5.6.7\n"
+        "max_advertised_endpoints: 5\n");
 
     const edriel::Config cfg = edriel::loadConfig(path.string());
     EXPECT_EQ(cfg.port, 40001);
     EXPECT_EQ(cfg.multicastAddress, "224.0.0.10");
     EXPECT_EQ(cfg.discoverySendPeriod, std::chrono::seconds(3));
     EXPECT_EQ(cfg.participantTimeout, std::chrono::seconds(12));
+    EXPECT_EQ(cfg.grpcPort, 4700);
+    EXPECT_EQ(cfg.maxAdvertisedEndpoints, 5u);
+    ASSERT_EQ(cfg.advertiseAddresses.size(), 1u);
+    EXPECT_EQ(cfg.advertiseAddresses[0], "10.5.6.7");
     EXPECT_FALSE(cfg.fellBackToDefaults);
 }
 
 TEST(LoadConfig, FallsBackPerKeyOnInvalid) {
     // Only the port is invalid -> multicast stays. Verify per-key fallback.
+    // The new reliable keys are absent (their presence isn't the point here);
+    // absence makes the diagnostics flag flip, as with any key.
     const auto path = writeTempConfig(
         "port: 0\n"
-        "multicast_ip: 234.5.6.7\n");
+        "multicast_ip: 234.5.6.7\n"
+        "grpc_port: 4700\n"
+        "max_advertised_endpoints: 5\n");
 
     const edriel::Config cfg = edriel::loadConfig(path.string());
     EXPECT_EQ(cfg.port, kDefaultPort);              // invalid -> default
     EXPECT_EQ(cfg.multicastAddress, "234.5.6.7");   // valid -> kept
+    EXPECT_EQ(cfg.grpcPort, 4700);                  // valid -> kept
     EXPECT_TRUE(cfg.fellBackToDefaults);
 }
 
@@ -191,4 +204,139 @@ TEST(LoadConfig, MalformedYamlYieldsDefaults) {
     const edriel::Config cfg = edriel::loadConfig(path.string());
     EXPECT_EQ(cfg.port, kDefaultPort);
     EXPECT_EQ(cfg.multicastAddress, kDefaultMc);
+}
+
+// --- parseMaxEndpoints ------------------------------------------------------
+
+constexpr uint16_t kDefaultGrpcPort = 4000;
+const std::size_t kDefaultMaxEndpoints = edriel::kDefaultMaxAdvertisedEndpoints;
+
+TEST(ParseMaxEndpoints, AcceptsValidRange) {
+    EXPECT_EQ(edriel::parseMaxEndpoints("1"), 1u);
+    EXPECT_EQ(edriel::parseMaxEndpoints("4"), 4u);
+    EXPECT_EQ(edriel::parseMaxEndpoints("64"), 64u);
+}
+
+TEST(ParseMaxEndpoints, FallsBackOnInvalid) {
+    EXPECT_EQ(edriel::parseMaxEndpoints("0"), kDefaultMaxEndpoints);
+    EXPECT_EQ(edriel::parseMaxEndpoints(""), kDefaultMaxEndpoints);
+    EXPECT_EQ(edriel::parseMaxEndpoints("abc"), kDefaultMaxEndpoints);
+    EXPECT_EQ(edriel::parseMaxEndpoints("-1"), kDefaultMaxEndpoints);
+    EXPECT_EQ(edriel::parseMaxEndpoints(" 4"), kDefaultMaxEndpoints);  // junk
+}
+
+TEST(ParseMaxEndpoints, ClampsAboveCeiling) {
+    // Values above the sane ceiling clamp to the cap, not the fallback.
+    EXPECT_EQ(edriel::parseMaxEndpoints("1000"),
+              edriel::kMaxAdvertisedEndpointsCap);
+}
+
+// --- loadConfig: grpc / advertise keys --------------------------------------
+
+TEST(LoadConfig, ParsesGrpcPort) {
+    const auto path = writeTempConfig("grpc_port: 4400\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.grpcPort, 4400);
+}
+
+TEST(LoadConfig, InvalidGrpcPortFallsBack) {
+    const auto path = writeTempConfig("grpc_port: 0\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.grpcPort, kDefaultGrpcPort);
+    EXPECT_TRUE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, MissingGrpcPortKeepsDefault) {
+    const auto path = writeTempConfig("port: 30002\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.grpcPort, kDefaultGrpcPort);
+}
+
+TEST(LoadConfig, ParsesScalarAdvertiseAddress) {
+    const auto path = writeTempConfig("advertise_address: 10.0.0.9\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    ASSERT_EQ(cfg.advertiseAddresses.size(), 1u);
+    EXPECT_EQ(cfg.advertiseAddresses[0], "10.0.0.9");
+}
+
+TEST(LoadConfig, ParsesListAdvertiseAddresses) {
+    const auto path = writeTempConfig(
+        "advertise_address:\n"
+        "  - 192.168.1.5\n"
+        "  - 10.0.0.3\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    ASSERT_EQ(cfg.advertiseAddresses.size(), 2u);
+    EXPECT_EQ(cfg.advertiseAddresses[0], "192.168.1.5");
+    EXPECT_EQ(cfg.advertiseAddresses[1], "10.0.0.3");
+}
+
+TEST(LoadConfig, MissingAdvertiseAddressLeavesEmpty) {
+    const auto path = writeTempConfig("port: 30002\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_TRUE(cfg.advertiseAddresses.empty());
+}
+
+TEST(LoadConfig, ParsesMaxAdvertisedEndpoints) {
+    const auto path = writeTempConfig("max_advertised_endpoints: 8\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.maxAdvertisedEndpoints, 8u);
+}
+
+TEST(LoadConfig, InvalidMaxAdvertisedEndpointsFallsBack) {
+    const auto path = writeTempConfig("max_advertised_endpoints: 0\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.maxAdvertisedEndpoints, kDefaultMaxEndpoints);
+    EXPECT_TRUE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, EmptyAdvertiseAddressIsNotFallback) {
+    // The shipped config.yml styles `advertise_address:` as an empty value
+    // (discover-only). That is a legitimate state, not a fallback: the flag
+    // stays false and the address list stays empty.
+    const auto path = writeTempConfig(
+        "port: 30002\n"
+        "multicast_ip: 239.255.0.1\n"
+        "discovery_period_seconds: 2\n"
+        "participant_timeout_seconds: 10\n"
+        "grpc_port: 4000\n"
+        "advertise_address:\n"
+        "  # - 192.168.1.5\n"
+        "max_advertised_endpoints: 4\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_TRUE(cfg.advertiseAddresses.empty());
+    EXPECT_FALSE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, GrpcKeysKeepOtherKeys) {
+    // New reliable-path keys coexist with the multicast keys (all valid ->
+    // no fallback flag fires).
+    const auto path = writeTempConfig(
+        "port: 31000\n"
+        "multicast_ip: 224.0.0.11\n"
+        "discovery_period_seconds: 3\n"
+        "participant_timeout_seconds: 12\n"
+        "grpc_port: 4500\n"
+        "advertise_address:\n"
+        "  - 10.1.2.3\n"
+        "max_advertised_endpoints: 6\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.port, 31000);
+    EXPECT_EQ(cfg.multicastAddress, "224.0.0.11");
+    EXPECT_EQ(cfg.discoverySendPeriod, std::chrono::seconds(3));
+    EXPECT_EQ(cfg.participantTimeout, std::chrono::seconds(12));
+    EXPECT_EQ(cfg.grpcPort, 4500);
+    EXPECT_EQ(cfg.maxAdvertisedEndpoints, 6u);
+    ASSERT_EQ(cfg.advertiseAddresses.size(), 1u);
+    EXPECT_EQ(cfg.advertiseAddresses[0], "10.1.2.3");
+    EXPECT_FALSE(cfg.fellBackToDefaults);
 }

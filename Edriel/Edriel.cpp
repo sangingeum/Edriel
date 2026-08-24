@@ -16,9 +16,17 @@
 
 #if defined(_WIN32)
 #include <process.h>
+#include <iphlpapi.h>   // GetAdaptersAddresses (interface discovery)
+#include <winsock2.h>
+#include <ws2tcpip.h>   // sockaddr_in, ntohl
 #else
 #include <unistd.h>
+#include <ifaddrs.h>    // getifaddrs (interface discovery)
+#include <netinet/in.h> // sockaddr_in
+#include <arpa/inet.h>  // ntohl, AF_INET on POSIX
 #endif
+
+#include <cstdint>  // std::uint8_t / std::uint32_t
 
 namespace edriel {
 
@@ -86,6 +94,113 @@ void Edriel::prependMagicNumberToPacket(std::string& packet) const {
     packet = std::move(newPacket);
 }
 
+// Endpoint candidates this node advertises, and parsing heartbeat endpoints.
+// ---------------------------------------------------------------------------
+
+/// Format a host-order IPv4 address as dotted quad (no inet_ntop/ntohl-in-
+/// shared-code dependency; kept to library-local, platform-guarded use).
+std::string formatIpv4(std::uint32_t hostOrder) {
+    return std::to_string((hostOrder >> 24) & 0xFF) + "."
+         + std::to_string((hostOrder >> 16) & 0xFF) + "."
+         + std::to_string((hostOrder >> 8) & 0xFF) + "."
+         + std::to_string(hostOrder & 0xFF);
+}
+
+/// Local unicast IPv4 addresses suitable for a unicast gRPC listener — skips
+/// the unspecified (0.0.0.0), loopback (127/8), and multicast/reserved
+/// (>=224) ranges. Empty on failure; the caller falls back to configured
+/// addresses. Platform-guarded: getifaddrs (POSIX) / GetAdaptersAddresses
+/// (Windows) so the library stays MSVC-portable.
+std::vector<std::string> discoverLocalUnicastIpv4() {
+    std::vector<std::string> out;
+#if defined(_WIN32)
+    ULONG bufsize = 0;
+    ::GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &bufsize);
+    std::vector<std::uint8_t> buf(bufsize);
+    auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    if (::GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &bufsize) != ERROR_SUCCESS) {
+        return out;
+    }
+    for (auto* a = adapters; a != nullptr; a = a->Next) {
+        if (a->OperStatus != I_OPER_UP) {
+            continue;
+        }
+        for (auto* u = a->FirstUnicastAddress; u != nullptr; u = u->Next) {
+            auto* sa = reinterpret_cast<struct sockaddr_in*>(u->Address.lpSockaddr);
+            if (sa == nullptr) {
+                continue;
+            }
+            const std::uint32_t hostOrder = ::ntohl(sa->sin_addr.s_addr);
+            const std::uint8_t first = static_cast<std::uint8_t>((hostOrder >> 24) & 0xFF);
+            if (first == 127 || first >= 224) {
+                continue;  // loopback / multicast
+            }
+            out.push_back(formatIpv4(hostOrder));
+        }
+    }
+#else
+    struct ifaddrs* ifa = nullptr;
+    if (::getifaddrs(&ifa) != 0) {
+        return out;
+    }
+    for (const struct ifaddrs* p = ifa; p != nullptr; p = p->ifa_next) {
+        if (p->ifa_addr == nullptr || p->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        const std::uint32_t hostOrder =
+            ::ntohl(reinterpret_cast<const struct sockaddr_in*>(p->ifa_addr)->sin_addr.s_addr);
+        const std::uint8_t first = static_cast<std::uint8_t>((hostOrder >> 24) & 0xFF);
+        if (first == 0 || first == 127 || first >= 224) {
+            continue;  // any / loopback / multicast
+        }
+        out.push_back(formatIpv4(hostOrder));
+    }
+    ::freeifaddrs(ifa);
+#endif
+    return out;
+}
+
+/// Assemble the Endpoint candidates this node advertises on its heartbeat
+/// (ADR-0002 Channel A): configured `advertise_address` first (deterministic),
+/// then discovered interfaces, deduped and capped at
+/// `max_advertised_endpoints` (MTU guard so the heartbeat cannot balloon).
+std::vector<autoDiscovery::Endpoint> buildSelfEndpoints(const Config& config) {
+    std::vector<autoDiscovery::Endpoint> result;
+    const auto append = [&result, &config](const std::string& address) {
+        if (address.empty() || result.size() >= config.maxAdvertisedEndpoints) {
+            return;
+        }
+        for (const auto& existing : result) {
+            if (existing.address() == address && existing.port() == config.grpcPort) {
+                return;  // dedupe identical candidate
+            }
+        }
+        autoDiscovery::Endpoint ep;
+        ep.set_address(address);
+        ep.set_port(config.grpcPort);
+        ep.set_transport(autoDiscovery::Endpoint::GRPC_TCP);
+        result.push_back(std::move(ep));
+    };
+    for (const std::string& configured : config.advertiseAddresses) {
+        append(configured);
+    }
+    for (const std::string& discovered : discoverLocalUnicastIpv4()) {
+        append(discovered);
+    }
+    return result;
+}
+
+/// Copy an Identifier's repeated endpoints into a standalone vector, used to
+/// thread heartbeat-advertised endpoints into the participant registry.
+std::vector<autoDiscovery::Endpoint> collectEndpoints(const autoDiscovery::Identifier& id) {
+    std::vector<autoDiscovery::Endpoint> out;
+    out.reserve(static_cast<std::size_t>(id.endpoints_size()));
+    for (int i = 0; i < id.endpoints_size(); ++i) {
+        out.push_back(id.endpoints(i));
+    }
+    return out;
+}
+
 // ============================================================================
 // Constructor & Destructor
 // ============================================================================
@@ -149,6 +264,11 @@ Edriel::Edriel(asio::io_context& io_ctx, const Config& config)
     discoveryMessage.mutable_identifier()->set_pid(selfParticipant.pid);
     discoveryMessage.mutable_identifier()->set_tid(selfParticipant.tid);
     discoveryMessage.mutable_identifier()->set_uid(selfParticipant.uid);
+    // Advertise our unicast gRPC endpoints on the heartbeat (ADR-0002 Channel
+    // A) so reliable streams can open as soon as a peer is discovered.
+    for (const auto& ep : buildSelfEndpoints(config_)) {
+        *discoveryMessage.mutable_identifier()->add_endpoints() = ep;
+    }
 }
 
 /**
@@ -236,6 +356,15 @@ void Edriel::postOnStrand(std::function<void()> thunk) {
  */
 void Edriel::startAutoDiscoverySender() {
     postOnStrand([this] {
+        // Refresh advertised endpoints each heartbeat so a config/interface
+        // change propagates on the next send. Cheap and strand-confined, so it
+        // never races the serialized discoveryMessage.
+        auto* id = discoveryMessage.mutable_identifier();
+        id->clear_endpoints();
+        for (const auto& ep : buildSelfEndpoints(config_)) {
+            *id->add_endpoints() = ep;
+        }
+
         // Serialize discovery message
         discoveryMessage.SerializeToString(&discoveryPacket);
         prependMagicNumberToPacket(discoveryPacket);
@@ -343,17 +472,20 @@ void Edriel::handleAutoDiscoveryParse(const autoDiscovery::Message& receivedMess
     if (receivedMessage.has_identifier()) {
 
         const auto& id = receivedMessage.identifier();
-        handleParticipantHeartbeat(id.pid(), id.tid(), id.uid());
+        handleParticipantHeartbeat(id.pid(), id.tid(), id.uid(),
+                                   collectEndpoints(id));
     } else if (receivedMessage.has_data_message()) {
         const auto& data = receivedMessage.data_message();
         const auto& id = data.identifier();
-        handleParticipantHeartbeat(id.pid(), id.tid(), id.uid());
+        handleParticipantHeartbeat(id.pid(), id.tid(), id.uid(),
+                                   collectEndpoints(id));
         handleDataMessageReceive(data);
     } else if (receivedMessage.has_advertisement()) {
         const auto& ad = receivedMessage.advertisement();
         const auto& id = ad.identifier();
         const auto& topic = ad.topic();
-        handleParticipantHeartbeat(id.pid(), id.tid(), id.uid());
+        handleParticipantHeartbeat(id.pid(), id.tid(), id.uid(),
+                                   collectEndpoints(id));
         handleTopicAnnouncement(
             id.pid(), id.tid(), id.uid(),
             topic.topic_name(),
@@ -371,7 +503,8 @@ void Edriel::handleAutoDiscoveryParse(const autoDiscovery::Message& receivedMess
  * @param tid Transaction ID
  * @param uid Unique identifier
  */
-void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid) {
+void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid,
+                                        std::vector<autoDiscovery::Endpoint> endpoints) {
     // Multicast loopback is enabled, so the node receives its own discovery
     // packets every send period. Never register ourselves: the uid is a
     // process-unique random token, so skipping it is a reliable self-filter.
@@ -388,18 +521,24 @@ void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_
         [pid, tid, uid](const Participant& p) {
             return p.pid == pid && p.tid == tid && p.uid == uid;
         });
-    
+
     if (it == participants.end()) {
         // New participant, create entry with the configured aliveness timeout.
         Participant newParticipant(pid, tid, uid, config_.participantTimeout);
-        
+
         // Set initial timestamp
         newParticipant.lastSeen = std::chrono::steady_clock::now();
-        
+        // Adopt the advertised endpoints from this first heartbeat.
+        newParticipant.endpoints = std::move(endpoints);
+
         participants.insert(newParticipant);
     } else {
-        // Existing participant, update timestamp
+        // Existing participant, update timestamp.
         it->updateLastSeen();
+        // Refresh advertised endpoints every heartbeat (ADR-0002): a restarted
+        // peer re-advertises on its first heartbeat; a moved IP overwrites the
+        // list in place. Idempotent and ~µs.
+        it->endpoints = std::move(endpoints);
     }
 }
 

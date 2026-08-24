@@ -32,3 +32,29 @@ discovery_period_seconds: 2
 #   - non-numeric, 0, or above the cap -> falls back to 10
 #   - the cleanup pass runs at timeout/2 (so a 10s timeout cleans every 5s)
 participant_timeout_seconds: 10
+
+# ----------------------------------------------------------------------------
+# Reliable path (ADR-0002): the gRPC ParticipantStreamService unicast plane.
+# Endpoints are piggybacked on the multicast heartbeat; this node both serves
+# its own grpc_port and, as a subscriber, dials publishers' endpoints.
+# ----------------------------------------------------------------------------
+
+# TCP listener port the node serves its reliable gRPC service on (the port
+# advertised on every advertised Endpoint candidate).
+#   - must be an integer in the valid port range 1..65535
+#   - non-numeric, 0, or out-of-range -> falls back to 4000
+grpc_port: 4000
+
+# Optional unicast addresses to advertise in addition to auto-discovered
+# interfaces (multi-homed / cross-subnet / multicast-blind nodes). May be a
+# single scalar or a YAML list; entries must be non-empty strings (IP literal
+# or hostname). Empty / absent -> advertise only discovered interfaces.
+advertise_address:
+  # - 192.168.1.5
+  # - 10.0.0.3
+
+# Cap on how many Endpoint candidates the heartbeat advertises (MTU guard so
+# the small heartbeat datagram cannot balloon).
+#   - must be a positive integer; values above 64 clamp to 64
+#   - non-numeric, 0, or empty -> falls back to 4
+max_advertised_endpoints: 4

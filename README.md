@@ -57,6 +57,10 @@ port: 30002
 multicast_ip: 239.255.0.1
 discovery_period_seconds: 2
 participant_timeout_seconds: 10
+grpc_port: 4000
+advertise_address:      # optional scalar or list; empty = discover-only
+  # - 192.168.1.5
+max_advertised_endpoints: 4
 ```
 
 | Key | Valid range | Falls back to |
@@ -65,6 +69,16 @@ participant_timeout_seconds: 10
 | `multicast_ip` | IPv4 multicast `224.0.0.0` .. `239.255.255.255` | `239.255.0.1` |
 | `discovery_period_seconds` | integer seconds in `1..86400` | `2` |
 | `participant_timeout_seconds` | integer seconds in `1..86400` | `10` |
+| `grpc_port` | integer in `1..65535` | `4000` |
+| `advertise_address` | scalar or list of non-empty strings (IP/hostname); empty/absent = discover-only | *empty list* |
+| `max_advertised_endpoints` | whole number, capped at `64` | `4` |
+
+The `grpc_port` / `advertise_address` / `max_advertised_endpoints` keys drive the
+reliable path (ADR-0002). Every node runs one gRPC server on `grpc_port` and
+advertises its unicast endpoints (`advertise_address`, plus any auto-discovered
+interfaces, capped at `max_advertised_endpoints`) on the multicast heartbeat —
+so peers can open reliable streams as soon as they are discovered. See
+*Reliable QoS* below.
 
 A missing, unreadable, or malformed `config.yml` behaves exactly like an
 invalid value: the defaults are used and no exception escapes. Because
@@ -86,9 +100,11 @@ edriel::Edriel edrielCfg(io, config);   // explicit edriel::Config
 ```
 
 `edriel::Config` has `port`, `multicastAddress`, `discoverySendPeriod`
-(`std::chrono::seconds`), `participantTimeout` (`std::chrono::seconds`), and a
-diagnostic `fellBackToDefaults` flag. The explicit-constructor overload lets a
-host application supply validated settings without a config file being present.
+(`std::chrono::seconds`), `participantTimeout` (`std::chrono::seconds`),
+`grpcPort`, `advertiseAddresses` (`std::vector<std::string>`),
+`maxAdvertisedEndpoints`, and a diagnostic `fellBackToDefaults` flag. The
+explicit-constructor overload lets a host application supply validated settings
+without a config file being present.
 
 ## Benchmark baseline
 

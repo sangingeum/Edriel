@@ -19,6 +19,7 @@
 #include <memory>
 #include <map>
 #include <set>
+#include <vector>
 #include <functional>
 #include <atomic>
 #include <mutex>   // registry synchronization
@@ -117,6 +118,10 @@ public:
         mutable std::chrono::steady_clock::time_point lastSeen;  ///< Last heartbeat time
         std::set<TopicInfo> publishedTopics;   ///< Topics this participant publishes
         std::set<TopicInfo> subscribedTopics;  ///< Topics this participant subscribes to
+        /// Advertised unicast gRPC endpoints (ADR-0002 Channel A), refreshed
+        /// on every heartbeat. Not part of the ordering key, hence mutable
+        /// (same pattern as `lastSeen`). Candidates tried in order, first-wins.
+        mutable std::vector<autoDiscovery::Endpoint> endpoints;
         std::chrono::seconds timeout = std::chrono::seconds(10);  ///< Aliveness timeout (from Config)
 
         /**
@@ -272,6 +277,9 @@ private:
     const std::map<std::string, TopicEntry>& registryForTest() const {
         return topicRegistry;
     }
+    const std::set<Participant>& participantsForTest() const {
+        return participants;
+    }
     void deliverForTest(const autoDiscovery::Message& msg) {
         handleAutoDiscoveryParse(msg);
     }
@@ -336,8 +344,12 @@ private:
      * @param pid Participant ID
      * @param tid Transaction ID
      * @param uid Unique identifier
+     * @param endpoints Advertised unicast gRPC endpoints from the heartbeat
+     *        (ADR-0002 Channel A); overwrites the participant's list on each
+     *        heartbeat so stale/moved peers re-advertise and refresh in place.
      */
-    void handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid);
+    void handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_t uid,
+                                    std::vector<autoDiscovery::Endpoint> endpoints);
     
     /**
      * @brief Removes participants that have timed out
