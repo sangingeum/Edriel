@@ -201,6 +201,10 @@ TEST(Reliable, RoundTripPublisherToSubscriber) {
 }
 
 TEST(Reliable, ReorderDedupExactlyOnce) {
+    // ISSUE #3: an EMPTY reorder window fast-forwards to a tid past nextExpected
+    // (accepted one-time catch-up for a late-joining subscriber) instead of
+    // buffering it forever. Within the fast-forwarded/in-order stream, duplicates
+    // are still dropped and contiguous frames delivered exactly-once in order.
     asio::io_context io;
     Edriel sub(io);
 
@@ -214,15 +218,47 @@ TEST(Reliable, ReorderDedupExactlyOnce) {
         },
         true));
 
-    // Deliver out of order and duplicated; expect exactly-once, in order.
-    sub.handleReliableDataFrame(makeReliableFrame(3, "three"));   // buffered
-    sub.handleReliableDataFrame(makeReliableFrame(1, "one"));     // delivers 1,3
-    sub.handleReliableDataFrame(makeReliableFrame(3, "three"));   // duplicate -> drop
-    sub.handleReliableDataFrame(makeReliableFrame(5, "five"));    // buffered (gap 4)
-    sub.handleReliableDataFrame(makeReliableFrame(4, "four"));    // delivers 4,5
+    // Late catch-up: tid 3 hits an empty window (nextExpected=1) -> fast-forward
+    // and deliver; a subsequent duplicate is dropped; in-order frames deliver.
+    sub.handleReliableDataFrame(makeReliableFrame(3, "three"));  // fast-forward
+    sub.handleReliableDataFrame(makeReliableFrame(3, "three"));  // duplicate -> drop
+    sub.handleReliableDataFrame(makeReliableFrame(4, "four"));   // in-order
+    sub.handleReliableDataFrame(makeReliableFrame(5, "five"));   // in-order
+    sub.handleReliableDataFrame(makeReliableFrame(2, "two"));    // stale (tid<next) -> drop
 
-    std::vector<std::string> expected{"one", "three", "four", "five"};
+    std::vector<std::string> expected{"three", "four", "five"};
     std::lock_guard<std::mutex> lock(mu);
+    EXPECT_EQ(delivered, expected);
+}
+
+TEST(Reliable, LateJoinerReceivesCurrentFrames) {
+    // ISSUE #3 regression: a subscriber that joins after the publisher's
+    // per-(publisher,topic) tid has already advanced (late joiner) must start
+    // receiving current frames immediately — the first tid past nextExpected on
+    // an empty window fast-forwards the cursor instead of buffering forever.
+    asio::io_context io;
+    Edriel sub(io);
+
+    std::vector<std::string> delivered;
+    std::mutex mu;
+    ASSERT_TRUE(sub.registerSubscriberTopic<autoDiscovery::Topic>(
+        "sensor",
+        [&delivered, &mu](const autoDiscovery::Topic& t) {
+            std::lock_guard<std::mutex> lock(mu);
+            delivered.push_back(t.topic_name());
+        },
+        true));
+
+    // A publisher already at tid 100: the late joiner (nextExpected=1) must
+    // fast-forward and deliver 100,101,102 rather than hold on empty gaps.
+    for (const auto& [tid, v] : std::vector<std::pair<std::uint64_t, std::string>>{
+             {100, "hundred"}, {101, "hundred-one"}, {102, "hundred-two"}}) {
+        sub.handleReliableDataFrame(makeReliableFrame(tid, v));
+    }
+
+    std::lock_guard<std::mutex> lock(mu);
+    const std::vector<std::string> expected{
+        "hundred", "hundred-one", "hundred-two"};
     EXPECT_EQ(delivered, expected);
 }
 
@@ -422,4 +458,195 @@ TEST(Reliable, MtuRejectOnOversizedFrame) {
     // A normal-size reliable message still flows exactly once.
     EXPECT_TRUE(pub.sendMessage("sensor", makePayloadValue("42")));
     ASSERT_TRUE(waitUntil([&]() { return calls.load() == 1; }, 3000));
+}
+
+TEST(Reliable, ReverseReliableDialBySeedOnlyPeer) {
+    // ISSUE #1: a multicast-blind peer reachable only via the `peers:` config
+    // seed dials THIS node in the reliable direction. Its identity is the
+    // deterministic (pid,0,uid) key synthesized from its configured endpoint
+    // (peerKeyForEndpoint, Channel D). The anti-spoof gate must accept it as a
+    // known peer (previously only participants + topicRegistry were consulted,
+    // so a seed-only dialer was rejected PERMISSION_DENIED).
+    const std::string seedEndpoint = "192.168.99.42:55000";
+
+    asio::io_context io;
+    edriel::Config cfg;
+    cfg.grpcPort = freeTcpPort();
+    cfg.peerEndpoints.push_back(seedEndpoint);
+    Edriel node(io, cfg);
+    node.startGrpcServer();
+
+    // The identity the seed-only peer dials with = peerKeyForEndpoint(endpoint).
+    const edriel::SubscriberKey seedKey = Edriel::peerKeyForEndpoint(seedEndpoint);
+
+    // The seed-only peer is a KNOWN participant per the anti-spoof gate (this
+    // is the actual ISSUE #1 fix), even though it was never heard on multicast.
+    EXPECT_TRUE(node.isKnownParticipant(seedKey.pid, seedKey.tid, seedKey.uid));
+
+    const auto channel = grpc::CreateChannel(
+        "127.0.0.1:" + std::to_string(cfg.grpcPort), grpc::InsecureChannelCredentials());
+    auto stub = autoDiscovery::ParticipantStreamService::NewStub(channel);
+
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+    auto stream = stub->StreamParticipants(&ctx);
+
+    autoDiscovery::ParticipantHeartbeat hb;
+    hb.set_pid(seedKey.pid);
+    hb.set_tid(seedKey.tid);
+    hb.set_uid(seedKey.uid);
+    ASSERT_TRUE(stream->Write(hb));
+    stream->WritesDone();
+
+    // Drain until the server closes the stream. The reverse reliable dial must
+    // NOT be rejected as an unknown dialer (previously PERMISSION_DENIED).
+    autoDiscovery::ParticipantData pd;
+    while (stream->Read(&pd)) {
+    }
+    const grpc::Status s = stream->Finish();
+    EXPECT_NE(s.error_code(), grpc::StatusCode::PERMISSION_DENIED)
+        << s.error_message();
+
+    // A fully-unknown identity is still rejected (anti-spoof intact).
+    EXPECT_FALSE(node.isKnownParticipant(9999u, 77u, 424242u));
+}
+
+TEST(Reliable, SubscribeFromDataCallbackNoDeadlock) {
+    // ISSUE #2 regression: a reliable-data frame is dispatched to the user
+    // callback from the connection reader thread, and the callback re-enters
+    // the reliable sub-system (startReliableSubscriptions()) while another
+    // thread is concurrently stopping/joining the connection. Before the fix,
+    // reconcile/stop joined the reader thread while holding reliableConnMutex_,
+    // so this self-deadlocked (join waits on a thread blocked on the mutex).
+    // After the fix, joins happen outside the mutex and the re-entrancy is safe.
+    asio::io_context ioPub, ioSub;
+
+    edriel::Config cfgPub;
+    cfgPub.grpcPort = freeTcpPort();
+    edriel::Config cfgSub;
+    cfgSub.grpcPort = freeTcpPort();
+
+    Edriel pub(ioPub, cfgPub);
+    Edriel sub(ioSub, cfgSub);
+
+    ASSERT_TRUE(pub.registerPublisherTopic<autoDiscovery::Topic>("sensor", true));
+    std::atomic<int> calls{0};
+    ASSERT_TRUE(sub.registerSubscriberTopic<autoDiscovery::Topic>(
+        "sensor",
+        [&](const autoDiscovery::Topic&) {
+            // Re-enter the reliable sub-system from the reader thread on every
+            // frame (the documented ISSUE #2 hazard). This triggers reconcile/
+            // teardown reconciliation; the fix ensures the teardown join runs
+            // OUTSIDE reliableConnMutex_, so re-entry from the reader thread is
+            // deadlock-free. Under the old lock-held join this self-deadlocked.
+            sub.startReliableSubscriptions();
+            ++calls;
+        },
+        true));
+
+    pub.startGrpcServer();
+
+    pub.deliverForTest(makeAdvert(sub.selfIdentityForTest(), "sensor", false, true,
+                                  "127.0.0.1", cfgSub.grpcPort));
+    sub.deliverForTest(makeAdvert(pub.selfIdentityForTest(), "sensor", true, true,
+                                  "127.0.0.1", cfgPub.grpcPort));
+
+    sub.startReliableSubscriptions();
+    ASSERT_TRUE(waitUntil([&]() { return pub.subscriberConnectedForTest(selfKey(sub)); }, 3000));
+
+    // Deliver an initial frame through the callback (re-entry happens on it).
+    ASSERT_TRUE(pub.sendMessage("sensor", makePayloadValue("first")));
+    ASSERT_TRUE(waitUntil([&]() { return calls.load() >= 1; }, 3000))
+        << "initial frame never delivered";
+
+    // A teardown while a frame is flowing drives the reader thread through the
+    // callback (which re-enters subscribe) AND the teardown join concurrently.
+    // The fix runs the join OUTSIDE reliableConnMutex_, so the re-entry is deadlock-
+    // free; under the old lock-held join the two threads would self-deadlock.
+    sub.stopReliableSubscriptions();
+    sub.startReliableSubscriptions();
+    ASSERT_TRUE(waitUntil([&]() { return pub.subscriberConnectedForTest(selfKey(sub)); }, 3000))
+        << "subscription did not restart after teardown cycle";
+
+    // Reconnected and delivering without deadlock.
+    EXPECT_TRUE(pub.sendMessage("sensor", makePayloadValue("second")));
+    ASSERT_TRUE(waitUntil([&]() { return calls.load() >= 2; }, 3000))
+        << "no delivery after re-entrant teardown/no-deadlock recovery";
+}
+
+/// Build a heartbeat Message registering participant (pid, tid, uid) so the
+/// timeout cleanup sees it as a live-then-stale peer (populates `participants`).
+autoDiscovery::Message makeHeartbeat(std::uint32_t pid, std::uint64_t tid,
+                                     std::uint64_t uid) {
+    autoDiscovery::Message m;
+    auto* id = m.mutable_identifier();
+    id->set_pid(pid);
+    id->set_tid(tid);
+    id->set_uid(uid);
+    return m;
+}
+
+/// Build a reliable frame from a publisher with the given (uid, pid, tid, topic).
+autoDiscovery::ParticipantData makeReliableFrameFrom(std::uint64_t uid,
+                                                     std::uint32_t pid,
+                                                     std::uint64_t tid,
+                                                     const std::string& topic,
+                                                     const std::string& value) {
+    autoDiscovery::DataMessage dm;
+    dm.mutable_identifier()->set_pid(pid);
+    dm.mutable_identifier()->set_tid(tid);
+    dm.mutable_identifier()->set_uid(uid);
+    dm.set_topic_name(topic);
+    dm.set_message_type("autoDiscovery.Topic");
+    dm.set_payload(makePayloadValue(value).SerializeAsString());
+    autoDiscovery::ParticipantData pd;
+    pd.set_reliable_data(dm.SerializeAsString());
+    return pd;
+}
+
+TEST(Reliable, ReliableWindowsPrunedOnPublisherTimeout) {
+    // ISSUE #4 regression: per-(publisher,topic) receive windows keyed by
+    // `to_string(pubUid)+"|"+compositeKey` must be pruned when the publisher
+    // participant times out (removeTimedOutParticipants). Without the prune the
+    // window map grows without bound as publishers cycle through the registry.
+    // reliablePublisherSeq_ is keyed by topic alone so it needs no per-pub
+    // pruning (bounded by topic count; asserted implicitly by the source).
+    asio::io_context io;
+    Edriel sub(io);
+
+    constexpr std::uint32_t kBasePid = 100;
+    constexpr std::uint64_t kBaseUid = 900000u;
+
+    // Register a batch of publishers that advertise/publish "sensor" reliably.
+    for (std::size_t i = 0; i < 8; ++i) {
+        const std::uint32_t pid = kBasePid + static_cast<std::uint32_t>(i);
+        const std::uint64_t uid = kBaseUid + i;
+        sub.deliverForTest(makeHeartbeat(pid, 0u, uid));
+        // A reliable frame from that publisher creates its receive window.
+        sub.handleReliableDataFrame(makeReliableFrameFrom(uid, pid, 1u, "sensor", "s"));
+        // A second topic window per publisher too (per-(pub,topic) growth).
+        sub.handleReliableDataFrame(makeReliableFrameFrom(uid, pid, 1u, "other", "o"));
+    }
+    EXPECT_EQ(sub.reliableWindowsSizeForTest(), 16u);
+
+    // Age every publisher and run the timeout cleanup: all windows must go.
+    for (std::size_t i = 0; i < 8; ++i) {
+        sub.ageParticipantForTest(kBaseUid + i);
+    }
+    sub.runTimeoutCleanupForTest();
+    EXPECT_EQ(sub.reliableWindowsSizeForTest(), 0u);
+
+    // Churn: publishers kept appearing/timing out across time; the map must
+    // return to zero on each timeout cleanup (no monotonic growth).
+    for (std::size_t i = 0; i < 5; ++i) {
+        const std::string topic = (i % 2 == 0) ? "sensor" : "gps";
+        const std::uint64_t uid = 300000u + i;
+        const std::uint32_t pid = 200u + static_cast<std::uint32_t>(i);
+        sub.deliverForTest(makeHeartbeat(pid, 0u, uid));
+        sub.handleReliableDataFrame(makeReliableFrameFrom(uid, pid, 1u, topic, "v"));
+        EXPECT_GE(sub.reliableWindowsSizeForTest(), 1u);
+        sub.ageParticipantForTest(uid);
+        sub.runTimeoutCleanupForTest();
+        EXPECT_EQ(sub.reliableWindowsSizeForTest(), 0u);
+    }
 }

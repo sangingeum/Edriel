@@ -342,6 +342,27 @@ private:
     void deliverForTest(const autoDiscovery::Message& msg) {
         handleAutoDiscoveryParse(msg);
     }
+    /// Number of live per-(publisher,topic) reliable receiver windows (test
+    /// hook for ISSUE #4's bounded-growth assertion).
+    std::size_t reliableWindowsSizeForTest() const {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        return reliableWindows_.size();
+    }
+    /// Age a known participant's last-seen so the next timeout cleanup removes
+    /// it (and its reliable receive windows). Test hook for the ISSUE #4 prune.
+    void ageParticipantForTest(std::uint64_t uid) {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        for (auto& p : participants) {
+            if (p.uid == uid) {
+                p.lastSeen -= std::chrono::hours(24);
+            }
+        }
+    }
+    /// Run the participant-timeout cleanup (removes stale participants and
+    /// prunes their reliable windows). Test hook for the ISSUE #4 prune.
+    void runTimeoutCleanupForTest() {
+        removeTimedOutParticipants();
+    }
 
   private:
     // ========================================================================
@@ -559,13 +580,21 @@ public:
 
     /**
      * @brief Whether a (pid,tid,uid) is a known peer in this node's registry —
-     *        either a discovered participant or a topic publisher/subscriber.
+     *        a discovered participant, a topic publisher/subscriber, or the
+     *        synthesized identity of a static `peers:` seed (Channel D).
      *
      * Internal accessor used by the gRPC service's anti-spoof gate (ADR-0002
      * §6.2): a dialer that is not a known participant is rejected before its
      * stream is registered or fed frames.
      */
     bool isKnownParticipant(std::uint32_t pid, std::uint64_t tid, std::uint64_t uid);
+
+    /**
+     * @brief Deterministic (pid,0,uid) key synthesized from a static `peers:`
+     * endpoint (ADR-0002 Channel D), giving a multicast-blind seed peer a
+     * stable identity for the subscriber-initiated dials and the anti-spoof gate.
+     */
+    static SubscriberKey peerKeyForEndpoint(const std::string& endpoint);
 
     /**
      * @brief Snapshot of every registered peer as ParticipantData (presence).

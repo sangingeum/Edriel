@@ -233,7 +233,7 @@ std::uint64_t fnv1a64(const std::string& s) {
 /// config-seeded peer that is never heard on the multicast group. The hash is
 /// split into independent pid/high-uid halves to keep distinct endpoints from
 /// collapsing onto the same key.
-SubscriberKey peerKeyForEndpoint(const std::string& endpoint) {
+SubscriberKey Edriel::peerKeyForEndpoint(const std::string& endpoint) {
     const std::uint64_t h = fnv1a64(endpoint);
     std::uint32_t pid = static_cast<std::uint32_t>(h >> 1);
     if (pid == 0) {
@@ -987,6 +987,19 @@ bool Edriel::isKnownParticipant(std::uint32_t pid, std::uint64_t tid, std::uint6
             }
         }
     }
+    // A static config `peers:` seed (ADR-0002 Channel D) is a known peer even
+    // though it is multicast-blind: it is never heard on the group and has no
+    // registry presence (no heartbeat, no topic announcement from network
+    // discovery). Its sole identity is the deterministic (pid,0,uid) key
+    // synthesized from its configured endpoint (peerKeyForEndpoint). Accept a
+    // dialer matching that key in either direction — the forward seed-subscriber
+    // and the reverse seed-only-peer dialing this node.
+    for (const std::string& seed : config_.peerEndpoints) {
+        const SubscriberKey seedKey = peerKeyForEndpoint(seed);
+        if (pid == seedKey.pid && uid == seedKey.uid) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -1117,20 +1130,25 @@ void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {
         if (tid == w.nextExpected) {
             deliver(data);
         } else if (tid > w.nextExpected) {
-            if ((tid - w.nextExpected) < kReliableWindowSize) {
-                // Within the bounded window: hold for reordering. Bounded — if
-                // full, drop the incoming (a gap is unrecoverable anyway).
-                if (w.buffer.size() < kReliableWindowSize) {
-                    w.buffer.emplace(tid, std::move(data));
-                }
-            } else if (w.buffer.empty()) {
-                // A gap past the whole window on a fresh/empty window means the
-                // preceding tids will never arrive (late-joining subscriber whose
-                // publisher already advanced its seq). Fast-forward the window to
-                // the incoming tid and deliver rather than buffer forever — the
-                // buffer is empty, so nothing cancels in-flight ordering.
+            if (w.buffer.empty()) {
+                // Fast-forward catch-up (ISSUE #3). An EMPTY window seeing a tid
+                // ahead of nextExpected is the signature of a late-joining
+                // subscriber whose publisher already advanced its seq: the tids
+                // between `nextExpected` and `tid` will never arrive (no NAK/
+                // replay at this layer), so buffering them here would stall the
+                // window forever. Fast-forward nextExpected to the incoming tid
+                // and deliver it, dropping the unrecoverable trailing gap. This
+                // is the accepted one-time catch-up for late joiners (ADR-0002
+                // has no catch-up spec); it supersedes buffering a stale gap on
+                // an otherwise-idle window.
                 w.nextExpected = tid;
                 deliver(data);
+            } else if ((tid - w.nextExpected) < kReliableWindowSize
+                       && w.buffer.size() < kReliableWindowSize) {
+                // Window is mid-stream (buffering an earlier hole / reorder):
+                // a within-bound gap is held for reordering. Bounded — if full,
+                // drop the incoming (mid-stream gap is unrecoverable anyway).
+                w.buffer.emplace(tid, std::move(data));
             }
             // else (non-empty window, gap beyond the bound) -> drop (stale/
             // unrecoverable); the window is waiting on a mid-stream gap.
@@ -1148,11 +1166,26 @@ void Edriel::startReliableSubscriptions() {
 }
 
 void Edriel::stopReliableSubscriptions() {
-    std::lock_guard<std::mutex> lock(reliableConnMutex_);
-    for (auto& kv : reliableConnections_) {
-        kv.second->stop();
+    // Collect the connections under the lock, release it, THEN stop() (which
+    // joins the reader thread) outside the mutex. stop() -> thread_.join()
+    // must not run while holding reliableConnMutex_: a user frame callback
+    // dispatched on one of those reader threads may re-enter
+    // startReliableSubscriptions()/unsubscribe, which takes the same mutex —
+    // joining a thread blocked on the very mutex we hold is a self-deadlock.
+    std::vector<std::unique_ptr<ReliableSubscriberConnection>> conns;
+    {
+        std::lock_guard<std::mutex> lock(reliableConnMutex_);
+        for (auto& kv : reliableConnections_) {
+            conns.push_back(std::move(kv.second));
+        }
+        reliableConnections_.clear();
     }
-    reliableConnections_.clear();
+    // stop() joins the reader thread; run it outside the lock. Note the
+    // abandoned unique_ptr's destructor also calls stop() (idempotent), so
+    // releasing the map under the lock must not destroy live connections.
+    for (auto& c : conns) {
+        c->stop();
+    }
 }
 
 void Edriel::reconcileReliableConnections() {
@@ -1207,50 +1240,68 @@ void Edriel::reconcileReliableConnections() {
         }
     }
 
-    std::lock_guard<std::mutex> lock(reliableConnMutex_);
+    // Connections whose reader thread must be joined, stopped AFTER the mutex
+    // is released. stop() -> thread_.join() must not run while holding
+    // reliableConnMutex_: a user frame callback dispatched on a reader thread
+    // may re-enter startReliableSubscriptions()/subscribe (same mutex), and
+    // joining a thread blocked on the very mutex we hold is a self-deadlock.
+    std::vector<std::unique_ptr<ReliableSubscriberConnection>> retire;
+    {
+        std::lock_guard<std::mutex> lock(reliableConnMutex_);
 
-    // Drop connections no longer needed (publisher left / topic unsubscribed).
-    for (auto it = reliableConnections_.begin(); it != reliableConnections_.end();) {
-        bool stillNeeded = false;
-        for (const Target& t : needed) {
-            if (t.key == it->first) {
-                stillNeeded = true;
-                break;
+        // Drop connections no longer needed (publisher left / topic unsubscribed).
+        for (auto it = reliableConnections_.begin(); it != reliableConnections_.end();) {
+            bool stillNeeded = false;
+            for (const Target& t : needed) {
+                if (t.key == it->first) {
+                    stillNeeded = true;
+                    break;
+                }
+            }
+            if (!stillNeeded) {
+                retire.push_back(std::move(it->second));
+                it = reliableConnections_.erase(it);
+            } else {
+                ++it;
             }
         }
-        if (!stillNeeded) {
-            it->second->stop();
-            it = reliableConnections_.erase(it);
-        } else {
-            ++it;
+
+        // Dial publishers we are not yet connected to, and re-dial a connection
+        // whose *currently-connected endpoint* is no longer in the publisher's
+        // advertised set (endpoint change / IP move / peer restart under the same
+        // identity — ADR-0002 §5). Connect-in-order (first advertised candidate),
+        // and the connection owns the candidate fallback (multi-homed §6.3).
+        for (const Target& t : needed) {
+            const auto existing = reliableConnections_.find(t.key);
+            if (existing != reliableConnections_.end()) {
+                const std::string connected = existing->second->currentEndpoint();
+                const bool connectedStale = !connected.empty() &&
+                    std::find(t.candidates.begin(), t.candidates.end(), connected)
+                        == t.candidates.end();
+                if (!connectedStale) {
+                    continue;  // still connected to a currently advertised endpoint
+                }
+                // Re-dial: the peer moved to a new endpoint set this node isn't on.
+                // Retire the old connection (stopped outside the lock below) and
+                // fall through to create a fresh one at the same key.
+                retire.push_back(std::move(existing->second));
+                reliableConnections_.erase(existing);
+            }
+
+            auto conn = std::make_unique<ReliableSubscriberConnection>(
+                *this, t.key, t.candidates,
+                static_cast<std::uint32_t>(selfParticipant.pid), selfParticipant.tid,
+                selfParticipant.uid);
+            conn->start();
+            reliableConnections_[t.key] = std::move(conn);
         }
     }
 
-    // Dial publishers we are not yet connected to, and re-dial a connection
-    // whose *currently-connected endpoint* is no longer in the publisher's
-    // advertised set (endpoint change / IP move / peer restart under the same
-    // identity — ADR-0002 §5). Connect-in-order (first advertised candidate),
-    // and the connection owns the candidate fallback (multi-homed §6.3).
-    for (const Target& t : needed) {
-        const auto existing = reliableConnections_.find(t.key);
-        if (existing != reliableConnections_.end()) {
-            const std::string connected = existing->second->currentEndpoint();
-            const bool connectedStale = !connected.empty() &&
-                std::find(t.candidates.begin(), t.candidates.end(), connected)
-                    == t.candidates.end();
-            if (!connectedStale) {
-                continue;  // still connected to a currently advertised endpoint
-            }
-            // Re-dial: the peer moved to a new endpoint set this node isn't on.
-            existing->second->stop();
-        }
-
-        auto conn = std::make_unique<ReliableSubscriberConnection>(
-            *this, t.key, t.candidates,
-            static_cast<std::uint32_t>(selfParticipant.pid), selfParticipant.tid,
-            selfParticipant.uid);
-        conn->start();
-        reliableConnections_[t.key] = std::move(conn);
+    // Join retired reader threads outside the mutex (see comment above). The
+    // unique_ptr destructor also calls stop() (idempotent). Deadlock-free by
+    // construction: no stop()/join() runs under reliableConnMutex_.
+    for (auto& c : retire) {
+        c->stop();
     }
 }
 
