@@ -251,25 +251,31 @@ TEST(Benchmark, ThroughputMsgsPerSecond) {
 // This benchmark closes it: it presses `kTopics` chosen to hash to four
 // DISTINCT shards (ADR-003 owner decision #2 — topic-only shard key) so all
 // `worker_threads` workers dispatch in parallel, and it drives them with
-// enough producers to clear the 1.5x bar.
+// enough producers to clear the 1.5x bar. Four producers are used so the
+// unpaced flood RELIABLY exceeds the consumer's ceiling on every run: with
+// only two, a scheduling under-delivery could let the consumer absorb nearly
+// all offered frames, tripping the saturation self-test (GitHub issue #7).
 //
-// HARD GATE (must FAIL CI on a regression to baseline): consumer TRUE MAX
-// delivered msgs/s >= 1.5 * baseline. Baseline: baseline_2node_receive_59412eb.md
+// HARD GATE (must FAIL CI on a regression to baseline): consumer saturated
+// throughput msgs/s >= 1.5 * baseline. Baseline: baseline_2node_receive_59412eb.md
 // (HEAD 59412eb) two-node consumer receive ceiling ~118k msgs/s (band 114-139k).
 // 1.5 * ~118k = ~177k, encoded in kBaselineRecvMsgsPerSec below. Owner re-bases
 // by editing that constant (and this comment); the bar is not silently lowered.
 //
-// TRUE-UNPUSHED-MAX (owner re-measure): the earlier keep-pace run PACED the two
-// producers (~210k msgs/s) and thus reported a SUSTAINED-KEEP-PACE consumer
-// rate, NOT the consumer's unpushed ceiling. Here the producers instead FLOOD
-// unpaced, far above what the consumer can absorb, so the consumer is genuinely
-// SATURATED and the measurement is its TRUE max delivered rate, not a paced
-// producer target. The reported number is the consumer's best achieved one-
-// second window of DELIVERED msgs while saturated; producer send max = frames
-// that reached the consumer socket / flood window (distinguished from absorbed).
-// Loss is surfaced by droppedFrames(), which includes kernel SO_RXQ_OVFL
-// overruns (issue #6 "ring_dropped=0 blind spot" fix); loss% is reported at the
-// true-max operating point.
+// SATURATED-TRUE-MAX (owner re-measure): the earlier keep-pace run PACED the
+// producers (~210k msgs/s) so consumer reported a SUSTAINED-KEEP-PACE rate,
+// not the unpushed ceiling. Here the producers instead FLOOD unpaced, far above
+// what the consumer can absorb, so the consumer is genuinely SATURATED. The
+// reported & gated figure is consumerTrueMax — best-1s DELIVERED window — the
+// consumer's true unpushed ceiling. It is stable here (~450-540k) because (a)
+// with four producers the flood always saturates AND (b) the arrival histogram
+// covers the entire active span (kBucketCount=2048), so the sliding wheel never
+// wraps. The earlier ~600-800k readings were inflated by the same histogram
+// wrapping on the producer-backlog drain (1024 buckets over a ~16s span).
+// Producer send = frames that reached the consumer socket / flood window
+// (distinguished from absorbed); loss (a.k.a. the drop rate at that operating
+// point) is surfaced by droppedFrames(), which includes kernel SO_RXQ_OVFL
+// overruns (issue #6 "ring_dropped=0 blind spot" fix).
 // ----------------------------------------------------------------------------
 TEST(Benchmark, TwoNodeReceiveThroughput) {
     constexpr std::size_t kPayloadBytes = 256;
@@ -279,7 +285,7 @@ TEST(Benchmark, TwoNodeReceiveThroughput) {
     // Producer nodes, each on its own io_context/thread (decoupled from the
     // consumer — NEVER one shared io_context: that reproduces the single-node
     // ~1 msgs/s starvation artifact).
-    constexpr int kProducers = 2;
+    constexpr int kProducers = 4;
     // ADR-003 gate baseline (see comment above): ~118k msgs/s consumer recv at
     // HEAD 59412eb. The 1.5x bar = ~177k.
     constexpr double kBaselineRecvMsgsPerSec = 118000.0;
@@ -301,7 +307,11 @@ TEST(Benchmark, TwoNodeReceiveThroughput) {
     // tolerant "sustained msgs/s" figure. A first->last span is distorted when
     // a paced producer stalls between bursts; a one-second sliding max is not.
     constexpr int kBucketMs = 10;
-    constexpr int kBucketCount = 1024;          // 10.24 s coverage at 10 ms
+    constexpr int kBucketCount = 2048;          // 20.48 s coverage at 10 ms
+                                                // (>= the ~16 s producer-backlog
+                                                // drain, so the sliding-sum
+                                                // window never wraps and
+                                                // corrupts the peak/median)
     constexpr int kBucketsPerSec = 1000 / kBucketMs;
     std::array<std::atomic<int64_t>, kBucketCount> arrivalBuckets{};
     std::atomic<int64_t> t0Us{0};               // set just before producers start
@@ -452,8 +462,11 @@ TEST(Benchmark, TwoNodeReceiveThroughput) {
     // Sustained (best one-second window) receive rate, directly from the arrival
     // histogram. This is the scheduling-jitter tolerant "sustained end-to-end
     // msgs/s" the ADR gate names — it measures the best full second the receive
-    // path actually held under the paced burst, immune to a producer stall
-    // distorting a first->last span.
+    // path actually held under the flood, immune to a producer stall distorting
+    // a first->last span. (The histogram must cover the WHOLE active delivery
+    // span including the producer-backlog drain — kBucketCount=2048 — or the
+    // ring indexes wrap and the sliding sum corrupts the peak. The old 1024
+    // buckets did exactly that and inflated the earlier ~600-800k figures.)
     int64_t peakWindow = 0;
     {
         int64_t window = 0;
@@ -507,14 +520,14 @@ TEST(Benchmark, TwoNodeReceiveThroughput) {
         static_cast<long long>(perTopic[3].load()));
     std::fflush(stdout);
 
-    // HARD GATE (owner re-measure): consumer TRUE max >= 1.5x baseline with all
-    // worker shards exercised under an unpaced flood. Regression to baseline
-    // (~118k) fails CI.
+    // HARD GATE (owner re-measure): consumer TRUE max (best 1s delivered)
+    // >= 1.5x baseline with all worker shards exercised under an unpaced flood.
+    // Regression to baseline (~118k) fails CI.
     EXPECT_GT(offered, 0);
     EXPECT_GE(got, 2000LL);
     // Saturation: the consumer must genuinely be flooded — if it absorbed nearly
     // all the wire carried, the producers weren't pushing past its ceiling and
-    // the true max was under-exercised.
+    // the measured max was under-exercised.
     EXPECT_LT(static_cast<double>(got) /
                   (offered > 0 ? static_cast<double>(offered) : 1.0),
               0.97)

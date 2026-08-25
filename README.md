@@ -136,23 +136,26 @@ per message.
 ### True unpushed receive max (N=4, ADR-003)
 
 Measured with `Benchmark.TwoNodeReceiveThroughput` in `Edriel/test/benchmark.cpp`
-(worker_threads=4, 4 shard-distinct topics over multicast loopback, 256 B
-payload). This harness *floods* the consumer unpaced — the producers send as
-fast as the wire will carry (~1.1–1.8M frames/s offered to the consumer socket),
-so the consumer is genuinely saturated and the delivered figure is its TRUE
-unpushed ceiling, not a producer-paced target.
+(worker_threads=4, 4 shard-distinct topics over multicast loopback, 256 B
+payload). This harness *floods* the consumer unpaced — four producers send as
+fast as their strands and the loopback wire will carry (~2.2–2.4M frames/s
+offered to the consumer socket), so the consumer is genuinely saturated on
+every run and the delivered figure is its TRUE unpushed ceiling, not a
+producer-paced target.
 
 | Metric (N=4, 2026-08)                | Value                                   |
 |--------------------------------------|-----------------------------------------|
-| Consumer true max received           | ~330k msgs/s (median best-1s window; typical runs 312–332k) |
-| Producer send max (offered)          | ~1.1–1.8M msgs/s (flood to loopback)    |
-| Loss at that operating point         | ~15–25% (best-1s; the ceiling is where loss climbs) |
+| Consumer true max received           | ~490k msgs/s (best 1s delivered window; median over runs, typical 450–540k) |
+| Producer send max (offered)          | ~2.2–2.4M msgs/s (4 producers, flood to loopback) |
+| Loss at that operating point         | ~30–60% — a genuinely saturated consumer drops whatever exceeds its ceiling |
 | Hard gate (1.5 × ~118k baseline)     | ≥ 177k msgs/s — passed in every run     |
 
-The old keep-pace figure (~211k msgs/s) *paced* the producers at a fixed target
-and reported the consumer keeping up; it under-stated the unpushed ceiling. The
-consumer's true unpushed max here is ~330k msgs/s, with loss climbing only once
-the flood drives past the socket's absorb rate. Reproduce with:
+The old keep-pace figure (~211k msgs/s) *paced* the producers at a cold wire
+target and reported the consumer keeping up; it under-stated the unpushed
+ceiling. The consumer's true unpushed max under a hard flood is ~490k msgs/s
+(best one-second window; the figure is the median of several runs). The number
+is what a fresh run of the benchmark prints as `CONSUMER TRUE MAX`, so this
+README value reproduces directly. Reproduce with:
 
 ```bash
 ./build/Release/Edriel/test/benchmark --gtest_filter=Benchmark.TwoNodeReceiveThroughput
