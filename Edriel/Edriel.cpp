@@ -26,6 +26,8 @@
 #else
 #include <unistd.h>
 #include <ifaddrs.h>    // getifaddrs (interface discovery)
+#include <sys/socket.h> // recvmsg/recv (drain loop), cmsghdr, native_fd
+#include <sys/uio.h>    // struct iovec (Linux recvmsg drain)
 #include <netinet/in.h> // sockaddr_in
 #include <arpa/inet.h>  // ntohl, AF_INET on POSIX
 #include <sys/time.h>   // struct timeval (SO_RCVTIMEO)
@@ -68,6 +70,182 @@ void setSocketReceiveTimeout(asio::ip::udp::socket& sock, unsigned long ms) {
 /// Receiver wakeup cadence (ms) — the idle loop polls this often; shutdown is
 /// observed within ~this interval.
 constexpr unsigned long kReceiverPollMs = 300;
+
+// ----------------------------------------------------------------------------
+// Fast receive-path routing.
+//
+// The multicast receiver must route every datagram to a worker shard BEFORE
+// the payload is decoded (ADR-003: transport work on the receiver thread,
+// semantic work on the worker). The original path called
+// `Message::ParseFromArray` on the ENTIRE datagram just to read the routing
+// key — that decodes the full nested `Identifier` (pid/tid/uid/endpoints) and
+// the user `payload` blob for every frame, which is the dominant per-frame cost
+// on the single receiver thread and (measured) caps the receive ceiling below
+// the ADR-003 1.5x bar.
+//
+// `tryReadRoutingKey` instead does a minimal wire-format walk that reads only
+// the fields needed to route DATA messages — the hot path the throughput gate
+// exercises:
+//   - outer `Message` oneof tag -> is a `DataMessage` present?
+//   - `DataMessage.topic_name` (field 2) + `message_type` (field 3) for topic
+//     routing, explicitly SKIPPING `identifier` (field 1) and `payload`
+//     (field 4).
+// It never decodes the payload. Bare heartbeats and topic advertisements are
+// deliberately NOT accelerated (they are infrequent and their key readback is
+// more nested); for those the caller falls back to the full `ParseFromArray`
+// path, which is correct and cheap at their rate. On any wire-format surprise
+// the data fast path returns 0 and the same fallback runs, so this is a safe
+// acceleration, never a correctness risk.
+// ----------------------------------------------------------------------------
+struct WireCursor {
+    const uint8_t* p;
+    const uint8_t* end;
+
+    bool valid() const { return p <= end; }
+    bool more() const { return p < end; }
+
+    bool varint(std::uint64_t& out) {
+        out = 0;
+        int shift = 0;
+        while (p < end && shift < 64) {
+            const uint8_t b = *p++;
+            out |= static_cast<std::uint64_t>(b & 0x7Fu) << shift;
+            if ((b & 0x80u) == 0) {
+                return true;
+            }
+            shift += 7;
+        }
+        return false;
+    }
+
+    // Reads a length-delimited field body; returns its span start (or nullptr).
+    const uint8_t* lengthDelimited(std::size_t& length) {
+        std::uint64_t l = 0;
+        if (!varint(l)) {
+            return nullptr;
+        }
+        length = static_cast<std::size_t>(l);
+        if (p + length > end) {
+            return nullptr;
+        }
+        const uint8_t* s = p;
+        p += length;
+        return s;
+    }
+
+    // Skips one field body given its wire type. Returns false on malformed data.
+    bool skipField(std::uint32_t wireType) {
+        std::uint64_t v = 0;
+        std::size_t l = 0;
+        switch (wireType) {
+            case 0: return varint(v);
+            case 1: if (p + 8 > end) return false; p += 8; return true;
+            case 2: return lengthDelimited(l) != nullptr;
+            case 5: if (p + 4 > end) return false; p += 4; return true;
+            default: return false;  // groups / unknown: not in this proto
+        }
+    }
+
+    // Reads the next field tag; returns false at clean end of message.
+    bool nextTag(std::uint32_t& fieldNumber, std::uint32_t& wireType) {
+        if (p >= end) {
+            return false;
+        }
+        std::uint64_t tag = 0;
+        if (!varint(tag)) {
+            return false;
+        }
+        fieldNumber = static_cast<std::uint32_t>(tag >> 3);
+        wireType = static_cast<std::uint32_t>(tag & 7u);
+        return true;
+    }
+
+    // Reads a length-delimited string field's bytes (no trailing-copy).
+    bool readString(std::string& out) {
+        std::size_t l = 0;
+        const uint8_t* s = lengthDelimited(l);
+        if (!s) {
+            return false;
+        }
+        out.assign(reinterpret_cast<const char*>(s), l);
+        return true;
+    }
+};
+
+/// Reads a `DataMessage {identifier=1, topic_name=2, message_type=3,
+/// payload=4}` length-delimited body — decoding ONLY the routing fields.
+bool readDataMessageRoutingKey(const uint8_t* body, std::size_t len,
+                               std::string& topic, std::string& messageType) {
+    WireCursor c{body, body + len};
+    std::uint32_t fn = 0, wt = 0;
+    while (c.nextTag(fn, wt)) {
+        if (wt != 2) {
+            if (!c.skipField(wt)) {
+                return false;
+            }
+            continue;
+        }
+        if (fn == 2) {
+            if (!c.readString(topic)) {
+                return false;
+            }
+        } else if (fn == 3) {
+            if (!c.readString(messageType)) {
+                return false;
+            }
+        } else {
+            // identifier (1) / payload (4): skip without decoding.
+            std::size_t l = 0;
+            if (!c.lengthDelimited(l)) {
+                return false;
+            }
+        }
+        if (!topic.empty() && !messageType.empty()) {
+            return true;
+        }
+    }
+    return !topic.empty() && !messageType.empty();
+}
+
+/// Tries to extract the topic routing key from a raw multicast frame (after
+/// the magic number) when it is a DATA message — the hot-path frame in the
+/// throughput benchmark. Returns 1 and fills `composite` on success, 0
+/// otherwise. Bare heartbeats and topic advertisements are UNCOMMON and are
+/// deliberately NOT handled here (their composite/uid readback is more nested);
+/// the caller falls back to the full `ParseFromArray` path for those, which is
+/// correct and cheap at their rate. Data is the frame that dominates the
+/// single-receiver thread's per-datagram cost, so only that path is
+/// accelerated.
+int tryReadRoutingKey(const uint8_t* raw, std::size_t len,
+                      std::string& composite) {
+    WireCursor c{raw, raw + len};
+    std::uint32_t fn = 0, wt = 0;
+    while (c.nextTag(fn, wt)) {
+        if (wt != 2) {
+            if (!c.skipField(wt)) {
+                return 0;
+            }
+            continue;
+        }
+        std::size_t bodyLen = 0;
+        const uint8_t* body = c.lengthDelimited(bodyLen);
+        if (!body) {
+            return 0;
+        }
+        if (fn == 3) {  // data_message
+            std::string topic, messageType;
+            if (readDataMessageRoutingKey(body, bodyLen, topic, messageType)) {
+                composite = topic + kTopicKeySeparator + messageType;
+                return 1;
+            }
+            return 0;
+        }
+        // identifier (1) / advertisement (2): not handled on the fast path;
+        // fall back to the full decode (correct, and they are infrequent).
+        return 0;
+    }
+    return 0;
+}
 
 }  // namespace
 
@@ -330,6 +508,20 @@ Edriel::Edriel(asio::io_context& io_ctx, const Config& config)
         autoDiscoverySocket->set_option(
             asio::socket_base::receive_buffer_size(config_.soRcvbufBytes));
     }
+    // Surface kernel socket-buffer overruns (SO_RXQ_OVFL, Linux): with a single
+    // fast drain thread the userland rings stay empty while the kernel drops a
+    // sustained burst upstream, so ring_dropped alone is a blind spot. When the
+    // kernel drops a datagram it emits a SO_RXQ_OVFL ancillary message on the
+    // next recvmsg; the receiver folds that count into droppedFrames() so
+    // end-to-end loss is never silent (issue #6). Non-Linux keeps the original
+    // recv() path with no kernel counter.
+#if defined(__linux__)
+    {
+        const int on = 1;
+        ::setsockopt(autoDiscoverySocket->native_handle(), SOL_SOCKET,
+                     SO_RXQ_OVFL, &on, sizeof(on));
+    }
+#endif
     // Bound the receiver thread's blocking receive so shutdown is observable
     // even if the socket close doesn't unblock it (deterministic teardown).
     setSocketReceiveTimeout(*autoDiscoverySocket, kReceiverPollMs);
@@ -344,7 +536,7 @@ Edriel::Edriel(asio::io_context& io_ctx, const Config& config)
     shards_.reserve(workerCount_);
     for (std::size_t i = 0; i < workerCount_; ++i) {
         auto shard = std::make_unique<Shard>();
-        shard->ring = std::make_unique<SpscRing<autoDiscovery::Message>>(
+        shard->ring = std::make_unique<SpscRing<RawFrame>>(
             config_.rxRingSlots > 0 ? config_.rxRingSlots
                                     : kDefaultRxRingSlots);
         shards_.push_back(std::move(shard));
@@ -522,8 +714,69 @@ void Edriel::armAutoDiscoveryReceive() {
                 return;
             }
             handleReceivedDatagram(n);
+            // Level-triggered drain: read *everything* already queued in the
+            // kernel before re-arming, so a single epoll wake-up services a
+            // whole burst instead of one datagram per dispatch. This is the
+            // single-receiver throughput lever for ADR-003 — it removes the
+            // per-datagram io-context dispatch cost from the receive ceiling.
+            // Using asio's synchronous receive() here would BLOCK (asio does a
+            // reactor wait on a sync receive of a socket it manages), so read
+            // the native fd directly: O_NONBLOCK (set by asio) -> -1/EAGAIN
+            // the instant the queue is momentarily empty.
+            for (;;) {
+#if defined(__linux__)
+                static_assert(recvBufferSize <= 65535, "iovec length cap");
+                char ctrl[CMSG_SPACE(sizeof(std::uint32_t))];
+                iovec iov;
+                iov.iov_base = receiverBuffer_.data();
+                iov.iov_len = recvBufferSize;
+                msghdr mh;
+                std::memset(&mh, 0, sizeof(mh));
+                mh.msg_iov = &iov;
+                mh.msg_iovlen = 1;
+                mh.msg_control = ctrl;
+                mh.msg_controllen = sizeof(ctrl);
+                const ssize_t m = ::recvmsg(autoDiscoverySocket->native_handle(),
+                                            &mh, MSG_DONTWAIT);
+                if (m <= 0) {
+                    break;
+                }
+                // SO_RXQ_OVFL cmsg: the value is the kernel's CUMULATIVE count of packets
+                // dropped on this socket since it was created (attached to the
+                // first packet read after an overflow). It is monotonic — the
+                // latest value is the final running total — so take the max,
+                // never sum it (summing cumulative counts over-reports wildly).
+                for (cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm != nullptr;
+                     cm = CMSG_NXTHDR(&mh, cm)) {
+                    if (cm->cmsg_level == SOL_SOCKET &&
+                        cm->cmsg_type == SO_RXQ_OVFL) {
+                        std::uint32_t dropped = 0;
+                        std::memcpy(&dropped, CMSG_DATA(cm), sizeof(dropped));
+                        std::uint64_t cur = kernelOverrunDropped_.load(
+                            std::memory_order_relaxed);
+                        while (static_cast<std::uint64_t>(dropped) > cur) {
+                            if (kernelOverrunDropped_.compare_exchange_weak(
+                                    cur,
+                                    static_cast<std::uint64_t>(dropped),
+                                    std::memory_order_relaxed)) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                handleReceivedDatagram(static_cast<std::size_t>(m));
+#else
+                const int m = ::recv(autoDiscoverySocket->native_handle(),
+                                     receiverBuffer_.data(),
+                                     static_cast<int>(recvBufferSize), 0);
+                if (m <= 0) {
+                    break;  // EAGAIN (drained) or an error
+                }
+                handleReceivedDatagram(static_cast<std::size_t>(m));
+#endif
+            }
             if (isRunning.load(std::memory_order_relaxed)) {
-                armAutoDiscoveryReceive();  // re-arm immediately (fast drain)
+                armAutoDiscoveryReceive();  // re-arm after the drain loop
             }
         });
 }
@@ -538,41 +791,61 @@ void Edriel::handleReceivedDatagram(std::size_t bytesTransferred) {
     if (ntohl(networkMagic) != MAGIC_NUMBER_VALUE) {
         return;
     }
-    // Parse just enough to route by topic (or by uid for a bare heartbeat).
-    // The payload decode + dispatch happen on the owning worker.
-    autoDiscovery::Message msg;
-    if (!msg.ParseFromArray(
-            receiverBuffer_.data() + static_cast<std::ptrdiff_t>(magicNumberSize),
-            bytesTransferred - magicNumberSize)) {
-        return;
-    }
+    const std::uint8_t* body = reinterpret_cast<const std::uint8_t*>(
+        receiverBuffer_.data()) + static_cast<std::ptrdiff_t>(magicNumberSize);
+    const std::size_t bodyLen = bytesTransferred - magicNumberSize;
+
+    // Transport path does only cheap routing + a raw-buffer copy into the owning
+    // shard's ring (ADR-003 §0: transport on the receiver, parse/dispatch on the
+    // worker). This keeps the full payload decode OFF the single receiver
+    // thread.
     Shard* target = nullptr;
-    if (msg.has_identifier()) {
-        const auto& id = msg.identifier();
-        target = &shardRef(shardIndexForUid(id.uid()));
-    } else if (msg.has_data_message()) {
-        const auto& d = msg.data_message();
-        target = &shardRef(shardIndexForTopic(
-            makeCompositeKey(d.topic_name(), d.message_type())));
-    } else if (msg.has_advertisement()) {
-        const auto& ad = msg.advertisement();
-        target = &shardRef(shardIndexForTopic(
-            makeCompositeKey(ad.topic().topic_name(), ad.topic().message_type())));
+    std::string composite;
+    const int routing = tryReadRoutingKey(body, bodyLen, composite);
+    if (routing == 1) {
+        target = &shardRef(shardIndexForTopic(composite));
     }
+    // Fast route failed (a bare heartbeat / topic advertisement / unexpected
+    // wire form) — fall back to a full decode so routing stays faithful to the
+    // original path. The worker still parses from the raw bytes we enqueue.
     if (target == nullptr) {
-        return;  // unrecognized oneof; drop
+        autoDiscovery::Message msg;
+        if (!msg.ParseFromArray(body, bodyLen)) {
+            return;
+        }
+        if (msg.has_identifier()) {
+            target = &shardRef(shardIndexForUid(msg.identifier().uid()));
+        } else if (msg.has_data_message()) {
+            const auto& d = msg.data_message();
+            target = &shardRef(shardIndexForTopic(
+                makeCompositeKey(d.topic_name(), d.message_type())));
+        } else if (msg.has_advertisement()) {
+            const auto& ad = msg.advertisement();
+            target = &shardRef(shardIndexForTopic(
+                makeCompositeKey(ad.topic().topic_name(), ad.topic().message_type())));
+        }
+        if (target == nullptr) {
+            return;  // unrecognized oneof; drop
+        }
     }
-    target->ring->publish(std::make_unique<autoDiscovery::Message>(std::move(msg)));
+    RawFrame frame;
+    frame.assign(body, body + bodyLen);
+    target->ring->publish(std::make_unique<RawFrame>(std::move(frame)));
 }
 
 void Edriel::autoDiscoveryWorkerLoop(std::size_t shardIndex) {
-    SpscRing<autoDiscovery::Message>* ring = shards_.at(shardIndex)->ring.get();
+    SpscRing<RawFrame>* ring = shards_.at(shardIndex)->ring.get();
     while (true) {
-        auto msg = ring->pop();
-        if (!msg) {
+        auto frame = ring->pop();
+        if (!frame) {
             break;  // ring closed and drained
         }
-        handleAutoDiscoveryParse(*msg);
+        autoDiscovery::Message msg;
+        // The receiver validated magic + routed this frame; decode here. A
+        // decode failure is unreachable in practice and is dropped silently.
+        if (msg.ParseFromArray(frame->data(), frame->size())) {
+            handleAutoDiscoveryParse(msg);
+        }
     }
 }
 

@@ -58,6 +58,12 @@ constexpr uint32_t MAGIC_NUMBER = 0xED75E1ED;
 /// tids; older-than-window duplicates are dropped.
 inline constexpr std::size_t kReliableWindowSize = 256;
 
+/// Raw multicast frame body handed from the receiver thread to a worker's
+/// SPSC ring (ADR-003 §0: transport copies a raw frame off the socket; the
+/// worker does the parse/dispatch). The ring owns this buffer by move; the
+/// worker parses it into `autoDiscovery::Message` for dispatch.
+using RawFrame = std::vector<std::uint8_t>;
+
 // Forward declaration: the gRPC ParticipantStreamService server for the
 // reliable path (ADR-0002), implemented in EdrielGrpcService.{hpp,cpp}.
 class ParticipantStreamServiceImpl;
@@ -335,7 +341,7 @@ private:
         /// Guards the registry halves below. `mutable` so const accessors
         /// (registry reads / snapshots) can synchronize too.
         mutable std::mutex mux;
-        std::unique_ptr<SpscRing<autoDiscovery::Message>> ring;
+        std::unique_ptr<SpscRing<RawFrame>> ring;
         std::thread worker;
         /// O(1) peer registry keyed on `uid` ALONE (ADR-003 decision #1) —
         /// the process-unique random identity, not a packed composite key.
@@ -357,6 +363,11 @@ private:
     /// could hang the join if the socket close didn't wake it).
     std::thread receiverThread_;
     asio::io_context receiverIo_;
+    /// Kernel socket-buffer overruns surfaced via SO_RXQ_OVFL (Linux): the
+    /// count of datagrams the kernel dropped before the receiver read them.
+    /// Folded into `droppedFrames()` so end-to-end loss is never silent even
+    /// when the userland rings stay empty (issue #6 blind spot).
+    std::atomic<std::uint64_t> kernelOverrunDropped_{0};
     /// Reused receive buffer; only touched by the receiver thread and never
     /// re-armed until the datagram is consumed into a ring.
     Buffer receiverBuffer_{};
@@ -417,9 +428,13 @@ private:
         removeTimedOutParticipants();
     }
     /// Total frames dropped by ring overflow (LMO drop-oldest) across all
-    /// shards — the observable, never-silent loss metric (ADR-003 decision #4).
+    /// shards PLUS kernel socket-buffer overruns surfaced via SO_RXQ_OVFL
+    /// (Linux) — the observable, never-silent end-to-end loss metric
+    /// (ADR-003 decision #4 + the post-impl issue #6 blind-spot fix). Reading
+    /// only the ring overruns was a blind spot: with a single drain thread the
+    /// userland rings stay empty while the kernel drops the burst upstream.
     std::uint64_t droppedFrames() const {
-        std::uint64_t total = 0;
+        std::uint64_t total = kernelOverrunDropped_.load();
         for (const auto& shard : shards_) {
             if (shard->ring) {
                 total += shard->ring->dropped();
