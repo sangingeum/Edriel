@@ -139,7 +139,9 @@ target_link_libraries(test_reliable PRIVATE
 
 add_test(NAME TestReliable COMMAND test_reliable)
 
-# benchmark: Performance benchmarks
+# benchmark: Performance benchmarks (latency, single-node throughput, and the
+# two-node receive-only ceiling). Registered under CTest so the ADR-003
+# receive-ceiling "before" number is part of the test suite.
 add_executable(benchmark
     benchmark.cpp
 )
@@ -156,3 +158,5 @@ target_link_libraries(benchmark PRIVATE
 target_include_directories(benchmark PRIVATE
     "${CMAKE_BINARY_DIR}"
 )
+
+add_test(NAME Benchmarks COMMAND benchmark)

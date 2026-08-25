@@ -90,11 +90,16 @@ struct BenchNode {
 
     ~BenchNode() {
         node->stopAutoDiscovery();
+        // Stop the io_context BEFORE joining so run() returns promptly instead
+        // of draining a queued backlog of async_sends against the closed
+        // socket. Without this, a heavy send burst (the throughput tests) can
+        // leave hundreds of thousands of stranded sends that each log a "Bad
+        // file descriptor" on teardown and keep the join alive for seconds.
+        io.stop();
         guard.reset();
         if (runner.joinable()) {
             runner.join();
         }
-        io.stop();
     }
 };
 
@@ -203,17 +208,143 @@ TEST(Benchmark, ThroughputMsgsPerSecond) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     const int64_t got = receivedCount.load();
+    const int64_t lost = sent - got;
+    const double lostPct =
+        (sent > 0) ? 100.0 * static_cast<double>(lost)
+                               / static_cast<double>(sent)
+                   : 0.0;
+    // Send side: one sendMessage() == one multicast datagram, so msgs/s IS the
+    // datagram rate; byte rate is reported as payload bytes/s for the app
+    // payload (dialect envelope overhead not included).
     const double sentRate = sent * 1000.0 / elapsedMs;
     const double recvRate = got * 1000.0 / elapsedMs;
+    const double sentByteRate = sentRate * static_cast<double>(kPayloadBytes);
+    const double recvByteRate = recvRate * static_cast<double>(kPayloadBytes);
     std::printf(
-        "[bench] throughput (%zuB payload): sent=%lld (%.0f msgs/s)  "
-        "received=%lld (%.0f msgs/s)\n",
-        kPayloadBytes, static_cast<long long>(sent), sentRate,
-        static_cast<long long>(got), recvRate);
+        "[bench] throughput (%zuB payload): sent=%lld (%.0f msgs/s, %.0f B/s)  "
+        "received=%lld (%.0f msgs/s, %.0f B/s)  lost=%lld (%.2f%%)\n",
+        kPayloadBytes, static_cast<long long>(sent), sentRate, sentByteRate,
+        static_cast<long long>(got), recvRate, recvByteRate,
+        static_cast<long long>(lost), lostPct);
     std::fflush(stdout);
 
     EXPECT_GT(sent, 0);
     EXPECT_GT(got, 0);
+}
+
+// ----------------------------------------------------------------------------
+// Two-node RECEIVE-ONLY throughput benchmark: dedicated producer + dedicated
+// consumer on DECOUPLED io_contexts (each its own thread).
+//
+// This is the ADR-003 "before" for the real receive ceiling. The single-node
+// ThroughputMsgsPerSecond collapses producer+consumer onto ONE io_context
+// thread, so the send side saturates the strand and starves the receive drain
+// (measured ~1 msgs/s, 100% silent kernel drop). Here the producer publishes
+// from its own io_context/thread and the consumer drains from its own, so the
+// consumer's receive path never contends with the send side. The number this
+// produces is the trustworthy receive ceiling ADR-003's >=1.5x gate builds
+// against.
+// ----------------------------------------------------------------------------
+
+TEST(Benchmark, TwoNodeReceiveThroughput) {
+    constexpr std::size_t kPayloadBytes = 256;
+    // Distinct topic so a stray single-node subscriber would not overlap.
+    const std::string kTopic = "throughput_2node";
+    // Publish a FIXED, bounded set of datagrams as fast as the producer's io
+    // thread will drain. A fixed count (rather than an unbounded time-window
+    // flood) keeps the producer's stranded async_send queue bounded, so every
+    // published datagram is delivered-or-dropped within the drain window and
+    // teardown stays fast. The count is chosen to outrun the consumer's
+    // single-threaded receive on loopback so the consumer saturates and reveals
+    // its true receive ceiling.
+    constexpr std::int64_t kPublishCount = 500000;
+
+    // Two independent Edriel nodes, each owning its own io_context/thread.
+    // NEVER share one io_context between them (that reproduces the starvation
+    // artifact the ADR-003 baseline measured).
+    BenchNode producer(3, 0, 3);
+    BenchNode consumer(4, 0, 4);
+
+    std::atomic<int64_t> receivedCount{0};
+    ASSERT_TRUE(consumer.node->registerSubscriberTopic<Ping>(
+        kTopic,
+        [&](const Ping&) { receivedCount.fetch_add(1, std::memory_order_relaxed); }));
+
+    // Settle: allow both nodes to join the multicast group / arm their
+    // receivers before the producer starts.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    Ping msg;
+    msg.set_seq(0);
+    msg.mutable_blob()->resize(kPayloadBytes, 'x');
+
+    const auto start = Clock::now();
+    std::int64_t sent = 0;
+    for (; sent < kPublishCount; ++sent) {
+        msg.set_seq(sent + 1);
+        if (!producer.node->sendMessage(kTopic, msg)) {
+            break;  // dispatch refused (MTU/serialize); stop cleanly
+        }
+    }
+
+    // Wait for the producer's strand to drain every send and the consumer to
+    // deliver everything it is going to. Poll until the consumer counter goes
+    // quiet (no new deliveries for ~500ms) or a hard ceiling is hit.
+    std::int64_t lastGot = -1;
+    int quietMs = 0;
+    for (int i = 0; i < 4000; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        const std::int64_t g = receivedCount.load(std::memory_order_relaxed);
+        if (g == lastGot) {
+            quietMs += 2;
+            if (quietMs >= 500) {
+                break;  // consumer drain is done
+            }
+        } else {
+            lastGot = g;
+            quietMs = 0;
+        }
+    }
+    // After the consumer has gone quiet, wait briefly more so the producer's
+    // io thread fully drains its queue while its socket is still open (keeps
+    // the BenchNode teardown from blocking on a mid-queue shutdown).
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto end = Clock::now();
+
+    const int64_t got = receivedCount.load();
+    const int64_t lost = sent - got;
+    const double lostPct =
+        (sent > 0) ? 100.0 * static_cast<double>(lost)
+                               / static_cast<double>(sent)
+                   : 0.0;
+    const double elapsedMs =
+        std::chrono::duration<double, std::milli>(end - start).count();
+    const double elapsedS =
+        std::chrono::duration<double>(end - start).count();
+    // Each sendMessage() carries one multicast datagram. The receive ceiling is
+    // delivered-datagrams / the true drain span (start -> quiesce).
+    const double sentRate = sent * 1000.0 / elapsedMs;
+    const double recvRate = (elapsedS > 0.0) ? got / elapsedS : 0.0;
+    const double sentByteRate = sentRate * static_cast<double>(kPayloadBytes);
+    const double recvByteRate = recvRate * static_cast<double>(kPayloadBytes);
+    std::printf(
+        "[bench] two-node receive-only (%zuB payload, %lld published): "
+        "producer %.0f msgs/s (%.0f B/s)  consumer received=%lld (%.0f "
+        "msgs/s, %.0f B/s)  lost=%lld (%.2f%%)\n",
+        kPayloadBytes, static_cast<long long>(sent),
+        sentRate, sentByteRate,
+        static_cast<long long>(got), recvRate, recvByteRate,
+        static_cast<long long>(lost), lostPct);
+    std::fflush(stdout);
+
+    // Real assertion, not a smoke check: the decoupled consumer must receive a
+    // meaningful fraction of what the producer sent — the single-node artifact
+    // collapses to ~1 msgs/s and 0.00% delivery. Keep the floor well above that
+    // artifact but comfortably checkable on an idle loopback host.
+    EXPECT_GT(sent, 0);
+    EXPECT_GE(got, 2000LL);
+    EXPECT_GT(recvRate, 1000.0);          // >> 1 msgs/s single-node artifact
+    EXPECT_LT(lostPct, 99.99);            // not the 100%-silent-drop case
 }
 
 }  // namespace edriel
