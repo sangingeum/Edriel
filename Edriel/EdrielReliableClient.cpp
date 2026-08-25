@@ -116,6 +116,20 @@ void ReliableSubscriberConnection::run_() {
                         break;
                     }
                 }
+                // Drain the RPC to its server-side completion before moving on.
+                // A sync ClientReaderWriter that is abandoned without Finish()
+                // only tears down the client half; the server's callback reactor
+                // (SubscriberReactor) keeps the call (and its subscriber-table
+                // entry) alive until gRPC asynchronously delivers its terminal
+                // callbacks. If a reconnect dials the same publisher before that
+                // happens, a frame can still route to the old reactor — and a
+                // concurrent OnReadDone/OnWriteDone(!ok) pair can even double-
+                // Finish it. Finish() blocks until the server has fully closed
+                // the RPC (its OnDone run, entry evicted), so the subscriber is
+                // quiesced before the next dial reuses the socket.
+                if (broken) {
+                    stream->Finish();  // drain to server Done; status discarded
+                }
                 {
                     std::lock_guard<std::mutex> lock(ctxMutex_);
                     activeCtx_ = nullptr;

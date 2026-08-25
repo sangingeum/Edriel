@@ -22,13 +22,18 @@ SubscriberReactor::~SubscriberReactor() = default;
 
 void SubscriberReactor::OnReadDone(bool ok) {
     if (!ok) {
-        // The client half-closed its side. Drain any queued frames first, then
-        // finish cleanly once the outbox is empty (defer to OnWriteDone if a
-        // write is in flight).
+        // The client half-closed its side (or the stream broke/failed). Drain
+        // any queued frames first, then finish cleanly once the outbox is empty
+        // (defer to OnWriteDone if a write is in flight). finish_() is one-shot
+        // and so a concurrently failing write (OnWriteDone(false)) cannot abort
+        // gRPC's finish tag by finishing the RPC twice.
         bool canFinish = false;
         bool needKick = false;
         {
             std::lock_guard<std::mutex> lock(m_);
+            if (finished_) {
+                return;  // already terminating (racing write/read failure)
+            }
             if (writing_) {
                 finishPending_ = true;      // finish after the in-flight write
             } else if (outbox_.empty()) {
@@ -39,7 +44,7 @@ void SubscriberReactor::OnReadDone(bool ok) {
             }
         }
         if (canFinish) {
-            Finish(grpc::Status::OK);
+            finish_(grpc::Status::OK);
             return;
         }
         if (needKick) {
@@ -59,8 +64,8 @@ void SubscriberReactor::OnReadDone(bool ok) {
         // frames. Unknown dialers are finished without registration, closing the
         // stream before it can receive presence or reliable data.
         if (!service_.owner().isKnownParticipant(key_.pid, key_.tid, key_.uid)) {
-            Finish(grpc::Status(grpc::StatusCode::PERMISSION_DENIED,
-                                "unknown dialer: not a known participant"));
+            finish_(grpc::Status(grpc::StatusCode::PERMISSION_DENIED,
+                                 "unknown dialer: not a known participant"));
             return;
         }
 
@@ -77,38 +82,85 @@ void SubscriberReactor::OnReadDone(bool ok) {
 }
 
 void SubscriberReactor::OnWriteDone(bool ok) {
+    bool finishNow = false;
     {
         std::lock_guard<std::mutex> lock(m_);
         writing_ = false;
+        if (!ok) {
+            // The write itself failed (stream broken / cancelled). gRPC may be
+            // concurrently failing the read too; the one-shot guard routes this
+            // to a single Finish. Prefer a CANCELLED here so teardown reads as
+            // a broken stream, not a clean OK.
+            finishNow = !finished_;
+        }
     }
     if (!ok) {
-        Finish(grpc::Status(grpc::StatusCode::CANCELLED, "stream broken"));
+        if (finishNow) {
+            finish_(grpc::Status(grpc::StatusCode::CANCELLED, "stream broken"));
+        }
         return;
     }
     // Drain any further queued frames. A client half-close while the outbox is
     // non-empty must not cut the queued presence/data frames short: keep
     // writing, and only finish once the outbox empties.
     startWrite_();
-    bool finishNow;
     {
         std::lock_guard<std::mutex> lock(m_);
         finishNow = finishPending_ && !writing_ && outbox_.empty();
     }
     if (finishNow) {
-        Finish(grpc::Status::OK);
+        finish_(grpc::Status::OK);
+    }
+}
+
+void SubscriberReactor::OnCancel() {
+    // The client tore the connection down (stop()/re-dial). gRPC invokes this
+    // promptly; retire the reactor from the subscriber table right away so the
+    // publisher stops routing pushes (and `subscriberConnectedForTest` stops
+    // reporting a dead stream as live) before the next dial registers. The
+    // stream's own terminal callbacks (OnReadDone/OnWriteDone false) still run
+    // and drive finish_() exactly once; here we only mark the intent and let
+    // the single-Finish invariant hold in the terminal callbacks.
+    std::lock_guard<std::mutex> lock(m_);
+    if (finished_) {
+        return;
+    }
+    if (initialised_) {
+        service_.unregisterSubscriber(key_, this);
     }
 }
 
 void SubscriberReactor::OnDone() {
     if (initialised_) {
-        service_.unregisterSubscriber(key_);
+        // Pointer-guarded: only remove this reactor from the table, never a
+        // newer one that reconnected under the same key meanwhile.
+        service_.unregisterSubscriber(key_, this);
     }
+}
+
+void SubscriberReactor::finish_(grpc::Status status) {
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        if (finished_) {
+            return;  // a racing OnReadDone/OnWriteDone already issued Finish
+        }
+        finished_ = true;
+    }
+    // gRPC's callback server allows exactly one Finish() per stream (it reuses
+    // a single finish tag, asserting it is clear on each call). Marking
+    // finished_ before issuing lets a concurrent, redundant terminal callback
+    // no-op instead of re-Set()-ing that tag, which would trip the library's
+    // `call_ == nullptr` CHECK and abort the process.
+    Finish(std::move(status));
 }
 
 void SubscriberReactor::enqueue(autoDiscovery::ParticipantData&& frame) {
     bool needWrite = false;
     {
         std::lock_guard<std::mutex> lock(m_);
+        if (finished_) {
+            return;  // stream is terminating; drop frames, do not touch the wire
+        }
         outbox_.push_back(std::move(frame));
         needWrite = !writing_;
     }
@@ -120,7 +172,7 @@ void SubscriberReactor::enqueue(autoDiscovery::ParticipantData&& frame) {
 void SubscriberReactor::startWrite_() {
     {
         std::lock_guard<std::mutex> lock(m_);
-        if (writing_ || outbox_.empty()) {
+        if (finished_ || writing_ || outbox_.empty()) {
             return;
         }
         writeBuffer_ = std::move(outbox_.front());
@@ -170,8 +222,8 @@ grpc::ServerUnaryReactor* ParticipantStreamServiceImpl::GetParticipantInfo(
 bool ParticipantStreamServiceImpl::pushData(const SubscriberKey& key,
                                             autoDiscovery::ParticipantData&& frame) {
     // Holding subsMutex_ across the enqueue guarantees the reactor stays alive
-    // for the whole push: OnDone's unregisterSubscriber blocks on the same
-    // mutex, and gRPC deletes the reactor only after OnDone returns.
+    // for the whole push: OnDone/OnCancel's guarded unregister blocks on the
+    // same mutex, and gRPC deletes the reactor only after OnDone returns.
     std::lock_guard<std::mutex> lock(subsMutex_);
     const auto it = subscribers_.find(key);
     if (it == subscribers_.end()) {
@@ -187,9 +239,13 @@ void ParticipantStreamServiceImpl::registerSubscriber(const SubscriberKey& key,
     subscribers_[key] = reactor;
 }
 
-void ParticipantStreamServiceImpl::unregisterSubscriber(const SubscriberKey& key) {
+void ParticipantStreamServiceImpl::unregisterSubscriber(const SubscriberKey& key,
+                                                        SubscriberReactor* reactor) {
     std::lock_guard<std::mutex> lock(subsMutex_);
-    subscribers_.erase(key);
+    const auto it = subscribers_.find(key);
+    if (it != subscribers_.end() && it->second == reactor) {
+        subscribers_.erase(it);
+    }
 }
 
 bool ParticipantStreamServiceImpl::hasSubscriber(const SubscriberKey& key) const {

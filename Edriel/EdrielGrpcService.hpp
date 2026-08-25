@@ -71,6 +71,10 @@ public:
     void OnReadDone(bool ok) override;
     /// Called by gRPC after each StartWrite completes.
     void OnWriteDone(bool ok) override;
+    /// Called by gRPC when the client cancels the RPC (e.g. its stop()/re-dial
+    /// tore down the connection). Retire promptly so the publisher stops
+    /// routing pushes to this now-dead stream.
+    void OnCancel() override;
     /// Called by gRPC when the RPC is fully finished and the reactor is about
     /// to be destroyed.
     void OnDone() override;
@@ -81,11 +85,21 @@ public:
 
 private:
     void startWrite_();  // if idle and the outbox is non-empty, StartWrite
+    /// Guarded finish: call Finish() at most once. gRPC's callback server
+    /// wraps terminal status in a single finish tag (finish_tag_) that it
+    /// `Set()`s per Finish call and asserts is clear; a second Finish() on the
+    /// same stream therefore aborts (callback_common.h `call_ == nullptr`).
+    /// On teardown, gRPC can fail _both_ the pending read and the in-flight
+    /// write, dispatching OnReadDone(false) and OnWriteDone(false) on separate
+    /// executor threads — without a one-shot guard these two finish the RPC
+    /// twice. This records the decision under m_ and issues Finish exactly once.
+    void finish_(grpc::Status status);
 
     ParticipantStreamServiceImpl& service_;
     autoDiscovery::ParticipantHeartbeat heartbeat_;  ///< current read buffer
     autoDiscovery::ParticipantData writeBuffer_;     ///< scratch sink for StartWrite
     bool initialised_{false};  ///< subscriber identity seen yet
+    bool finished_{false};     ///< one-shot: terminal Finish already issued
     SubscriberKey key_{0, 0, 0};
 
     std::mutex m_;
@@ -123,9 +137,17 @@ public:
     /// and liveness probe).
     bool hasSubscriber(const SubscriberKey& key) const;
 
-    /// Register/unregister a subscriber's reactor (called by SubscriberReactor).
+    /// Register the subscriber's reactor (called by SubscriberReactor once its
+    /// identity is known). If a previous reactor is still registered for the
+    /// same key, it is retired so it no longer receives pushes; the table then
+    /// maps the key to the newest live connection.
     void registerSubscriber(const SubscriberKey& key, SubscriberReactor* reactor);
-    void unregisterSubscriber(const SubscriberKey& key);
+    /// Remove `reactor` from the table only if it is still the registered entry
+    /// for `key` (a pointer-guarded erase). Called by SubscriberReactor when its
+    /// stream terminates. The guard matters during reconnect: an old reactor
+    /// whose OnDone fires after a new reactor registered must not erase the new
+    /// one.
+    void unregisterSubscriber(const SubscriberKey& key, SubscriberReactor* reactor);
 
 private:
     Edriel& owner_;
