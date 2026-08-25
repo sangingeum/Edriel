@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <string>
 #include <thread>
@@ -579,6 +580,66 @@ TEST(Reliable, SubscribeFromDataCallbackNoDeadlock) {
     EXPECT_TRUE(pub.sendMessage("sensor", makePayloadValue("second")));
     ASSERT_TRUE(waitUntil([&]() { return calls.load() >= 2; }, 3000))
         << "no delivery after re-entrant teardown/no-deadlock recovery";
+}
+
+TEST(Reliable, RapidTeardownRedialNoAbort) {
+    // BLOCKER regression: drive N rapid stopReliableSubscriptions()/
+    // startReliableSubscriptions() cycles with a reliable frame in flight on
+    // each. This is the only thing that deterministically races the server's
+    // OnReadDone(false) / OnWriteDone(!ok) terminal pair that the single-Finish
+    // guard (finish_) and prompt OnCancel eviction defend. Every cycle puts a
+    // frame on the in-flight StartWrite and then tears the connection down
+    // immediately, so the write can fail (OnWriteDone(!ok)) at the same moment
+    // the read failure (OnReadDone(false)) is delivered on another executor
+    // thread. WITHOUT the one-shot finish_ guard, that pair finishes the RPC
+    // twice and gRPC aborts the process (callback_common.h `call_ == nullptr`
+    // CHECK); with the guard, exactly one Finish is issued and the process
+    // survives the churn and keeps delivering afterwards.
+    asio::io_context ioPub, ioSub;
+
+    edriel::Config cfgPub;
+    cfgPub.grpcPort = freeTcpPort();
+    edriel::Config cfgSub;
+    cfgSub.grpcPort = freeTcpPort();
+
+    Edriel pub(ioPub, cfgPub);
+    Edriel sub(ioSub, cfgSub);
+
+    ASSERT_TRUE(pub.registerPublisherTopic<autoDiscovery::Topic>("sensor", true));
+    std::atomic<int> calls{0};
+    ASSERT_TRUE(sub.registerSubscriberTopic<autoDiscovery::Topic>(
+        "sensor", [&calls](const autoDiscovery::Topic&) { ++calls; }, true));
+    pub.startGrpcServer();
+
+    pub.deliverForTest(makeAdvert(sub.selfIdentityForTest(), "sensor", false, true,
+                                  "127.0.0.1", cfgSub.grpcPort));
+    sub.deliverForTest(makeAdvert(pub.selfIdentityForTest(), "sensor", true, true,
+                                  "127.0.0.1", cfgPub.grpcPort));
+
+    sub.startReliableSubscriptions();
+    ASSERT_TRUE(waitUntil([&]() { return pub.subscriberConnectedForTest(selfKey(sub)); }, 3000))
+        << "initial dial never landed";
+
+    constexpr int kCycles = 25;
+    for (int i = 0; i < kCycles; ++i) {
+        // A reliable frame lands on the server's outbox / in-flight write...
+        pub.sendMessage("sensor", makePayloadValue("churn-" + std::to_string(i)));
+        // ...then tear the connection down immediately, racing the terminal
+        // OnReadDone(false) / OnWriteDone(!ok) pair. No abort must happen and
+        // the re-dial must come back up.
+        sub.stopReliableSubscriptions();
+        sub.startReliableSubscriptions();
+        ASSERT_TRUE(waitUntil([&]() { return pub.subscriberConnectedForTest(selfKey(sub)); }, 2000))
+            << "re-dial stalled after churn cycle " << i;
+    }
+
+    // Stable delivery across the churn: a frame sent after all cycles still
+    // lands exactly once (frames dropped mid-teardown are expected; delivery
+    // resuming is not).
+    EXPECT_TRUE(pub.sendMessage("sensor", makePayloadValue("final")));
+    ASSERT_TRUE(waitUntil([&]() { return calls.load() >= 1; }, 3000))
+        << "no delivery after rapid teardown churn";
+    EXPECT_TRUE(pub.subscriberConnectedForTest(selfKey(sub)));
 }
 
 /// Build a heartbeat Message registering participant (pid, tid, uid) so the

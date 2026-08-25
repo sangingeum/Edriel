@@ -6,11 +6,18 @@
 #include "EdrielGrpcService.hpp"
 #include "Edriel.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+
 namespace edriel {
 
 // ============================================================================
 // SubscriberReactor
 // ============================================================================
+
+namespace {
+}
 
 SubscriberReactor::SubscriberReactor(ParticipantStreamServiceImpl& service)
     : service_(service) {
@@ -44,7 +51,7 @@ void SubscriberReactor::OnReadDone(bool ok) {
             }
         }
         if (canFinish) {
-            finish_(grpc::Status::OK);
+            finish_(teardownStatus_());
             return;
         }
         if (needKick) {
@@ -72,7 +79,7 @@ void SubscriberReactor::OnReadDone(bool ok) {
         service_.registerSubscriber(key_, this);
 
         for (autoDiscovery::ParticipantData& pd
-             : service_.owner().snapshotParticipantData()) {
+            : service_.owner().snapshotParticipantData()) {
             enqueue(std::move(pd));
         }
     }
@@ -109,23 +116,37 @@ void SubscriberReactor::OnWriteDone(bool ok) {
         finishNow = finishPending_ && !writing_ && outbox_.empty();
     }
     if (finishNow) {
-        finish_(grpc::Status::OK);
+        finish_(teardownStatus_());
     }
 }
 
 void SubscriberReactor::OnCancel() {
     // The client tore the connection down (stop()/re-dial). gRPC invokes this
-    // promptly; retire the reactor from the subscriber table right away so the
+    // promptly. Retire the reactor locally: record that this teardown is a
+    // genuine cancel (so the terminal Finish reports CANCELLED, not a clean
+    // OK) and that we must be evicted from the subscriber table so the
     // publisher stops routing pushes (and `subscriberConnectedForTest` stops
     // reporting a dead stream as live) before the next dial registers. The
-    // stream's own terminal callbacks (OnReadDone/OnWriteDone false) still run
-    // and drive finish_() exactly once; here we only mark the intent and let
-    // the single-Finish invariant hold in the terminal callbacks.
-    std::lock_guard<std::mutex> lock(m_);
-    if (finished_) {
-        return;
+    // stream's terminal callbacks (OnReadDone/OnWriteDone false) still run and
+    // drive finish_() exactly once; we deliberately do NOT set finished_ here
+    // (that would suppress the single Finish the terminal callbacks issue and
+    // leak the reactor, since gRPC only calls OnDone after a Finish).
+    bool shouldUnregister = false;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        if (finished_) {
+            return;
+        }
+        cancelled_ = true;
+        shouldUnregister = initialised_;
     }
-    if (initialised_) {
+    // Evict AFTER releasing m_: unregisterSubscriber takes the service-level
+    // subsMutex_, and taking it while still holding m_ would invert the lock
+    // order that pushData() establishes (subsMutex_ -> m_ via enqueue) — a
+    // lock-inversion deadlock. Mirror OnDone()'s shape: release m_ first, then
+    // touch the shared table. The pointer-guarded erase keeps an old reactor
+    // from evicting a newer one re-registered under the same key meanwhile.
+    if (shouldUnregister) {
         service_.unregisterSubscriber(key_, this);
     }
 }
@@ -154,11 +175,27 @@ void SubscriberReactor::finish_(grpc::Status status) {
     Finish(std::move(status));
 }
 
+grpc::Status SubscriberReactor::teardownStatus_() {
+    std::lock_guard<std::mutex> lock(m_);
+    return cancelled_ ? grpc::Status(grpc::StatusCode::CANCELLED, "client tore down")
+                      : grpc::Status::OK;
+}
+
+void SubscriberReactor::supersede() {
+    std::lock_guard<std::mutex> lock(m_);
+    cancelled_ = true;  // a newer dial owns the key; stop serving this stream
+}
+
+bool SubscriberReactor::isLive() {
+    std::lock_guard<std::mutex> lock(m_);
+    return !finished_ && !cancelled_;
+}
+
 void SubscriberReactor::enqueue(autoDiscovery::ParticipantData&& frame) {
     bool needWrite = false;
     {
         std::lock_guard<std::mutex> lock(m_);
-        if (finished_) {
+        if (finished_ || cancelled_) {
             return;  // stream is terminating; drop frames, do not touch the wire
         }
         outbox_.push_back(std::move(frame));
@@ -236,6 +273,14 @@ bool ParticipantStreamServiceImpl::pushData(const SubscriberKey& key,
 void ParticipantStreamServiceImpl::registerSubscriber(const SubscriberKey& key,
                                                       SubscriberReactor* reactor) {
     std::lock_guard<std::mutex> lock(subsMutex_);
+    const auto it = subscribers_.find(key);
+    // A newer generation of the same dial supersedes any predecessor still in
+    // the table (its gRPC cancel/eviction may lag the re-dial). Marking it now
+    // closes the window where a torn-down predecessor could still be reported
+    // connected or swallow a frame after the successor has registered.
+    if (it != subscribers_.end() && it->second != reactor) {
+        it->second->supersede();
+    }
     subscribers_[key] = reactor;
 }
 
@@ -250,7 +295,13 @@ void ParticipantStreamServiceImpl::unregisterSubscriber(const SubscriberKey& key
 
 bool ParticipantStreamServiceImpl::hasSubscriber(const SubscriberKey& key) const {
     std::lock_guard<std::mutex> lock(subsMutex_);
-    return subscribers_.count(key) != 0;
+    const auto it = subscribers_.find(key);
+    // Only a genuinely live stream counts as "connected": a successor that
+    // superseded it, or a stream whose client tore the connection down, must
+    // not keep reporting connected (subscriberConnectedForTest) or satisfy a
+    // dial's readiness before the fresh generation has actually registered.
+    const bool r = it != subscribers_.end() && it->second->isLive();
+    return r;
 }
 
 }  // namespace edriel

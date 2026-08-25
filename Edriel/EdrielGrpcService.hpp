@@ -83,23 +83,42 @@ public:
     /// kick a write if one is not already in flight.
     void enqueue(autoDiscovery::ParticipantData&& frame);
 
+    /// Thread-safe: is this stream still a live, deliverable subscriber? False
+    /// once teardown has begun (client cancel or terminal Finish), so the
+    /// publisher neither routes frames into a dead stream nor reports a
+    /// torn-down dial as connected.
+    bool isLive();
+
+    /// Thread-safe: mark this stream superseded by a newer dial of the same
+    /// subscriber (same key). Future enqueues are dropped and isLive() turns
+    /// false immediately, closing the window where a predecessor reactor could
+    /// still swallow frames after its successor has registered.
+    void supersede();
+
 private:
     void startWrite_();  // if idle and the outbox is non-empty, StartWrite
     /// Guarded finish: call Finish() at most once. gRPC's callback server
     /// wraps terminal status in a single finish tag (finish_tag_) that it
     /// `Set()`s per Finish call and asserts is clear; a second Finish() on the
     /// same stream therefore aborts (callback_common.h `call_ == nullptr`).
-    /// On teardown, gRPC can fail _both_ the pending read and the in-flight
+    /// On teardown, gRPC can fail both the pending read and the in-flight
     /// write, dispatching OnReadDone(false) and OnWriteDone(false) on separate
     /// executor threads — without a one-shot guard these two finish the RPC
     /// twice. This records the decision under m_ and issues Finish exactly once.
     void finish_(grpc::Status status);
+    /// Deliberate teardown Finish status: CANCELLED when the stream ended by a
+    /// genuine client cancel (OnCancel fired), OK on a clean client half-close
+    /// (WritesDone, no cancel). gRPC routes a graceful half-close to
+    /// OnReadDone(false) WITHOUT OnCancel and a teardown/cancel to both, so the
+    /// intent is keyed off the cancel flag, not the callback. Read under m_.
+    grpc::Status teardownStatus_();
 
     ParticipantStreamServiceImpl& service_;
     autoDiscovery::ParticipantHeartbeat heartbeat_;  ///< current read buffer
     autoDiscovery::ParticipantData writeBuffer_;     ///< scratch sink for StartWrite
     bool initialised_{false};  ///< subscriber identity seen yet
     bool finished_{false};     ///< one-shot: terminal Finish already issued
+    bool cancelled_{false};    ///< client-cancel teardown: finish CANCELLED not OK
     SubscriberKey key_{0, 0, 0};
 
     std::mutex m_;

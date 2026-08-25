@@ -7,6 +7,7 @@
 #include "Edriel.hpp"
 
 #include <chrono>
+#include <cstdio>
 
 namespace edriel {
 
@@ -14,6 +15,9 @@ namespace {
 /// Per-candidate connect deadline (bounded so a black-holed candidate cannot
 /// stall the connect-in-order scan forever). A refused/closed port fails fast.
 constexpr std::chrono::milliseconds kConnectTimeout{ 2000 };
+/// Per-teardown drain deadline: bound stream->Finish() so a wedged server
+/// cannot block stop()/dtor indefinitely on a never-completing RPC.
+constexpr std::chrono::milliseconds kFinishTimeout{ 2000 };
 /// Backoff between full scan passes when every candidate was unreachable.
 constexpr std::chrono::milliseconds kScanBackoff{ 200 };
 }  // namespace
@@ -105,6 +109,13 @@ void ReliableSubscriberConnection::run_() {
                     }
                     break;  // couldn't open a stream here -> advance candidate
                 }
+                // A fresh stream: the reconnect boundary is an explicit loss
+                // episode (whatever the prior stream was mid-buffering is gone,
+                // with no NACK/replay layer to recover it). Baseline the
+                // receiver's reorder windows for this publisher so the first
+                // frame of the new stream resumes delivery instead of stalling
+                // the window on an unreachable gap.
+                node_.noteReliableStreamEstablished(publisher_.uid);
 
                 autoDiscovery::ParticipantData frame;
                 bool broken = false;
@@ -116,20 +127,30 @@ void ReliableSubscriberConnection::run_() {
                         break;
                     }
                 }
-                // Drain the RPC to its server-side completion before moving on.
-                // A sync ClientReaderWriter that is abandoned without Finish()
-                // only tears down the client half; the server's callback reactor
-                // (SubscriberReactor) keeps the call (and its subscriber-table
-                // entry) alive until gRPC asynchronously delivers its terminal
-                // callbacks. If a reconnect dials the same publisher before that
-                // happens, a frame can still route to the old reactor — and a
-                // concurrent OnReadDone/OnWriteDone(!ok) pair can even double-
-                // Finish it. Finish() blocks until the server has fully closed
-                // the RPC (its OnDone run, entry evicted), so the subscriber is
-                // quiesced before the next dial reuses the socket.
-                if (broken) {
-                    stream->Finish();  // drain to server Done; status discarded
-                }
+                // Drain the RPC to its server-side completion before moving on,
+                // on EVERY exit path. A sync ClientReaderWriter abandoned
+                // without Finish() only tears down the client half; the server's
+                // callback reactor (SubscriberReactor) keeps the call (and its
+                // subscriber-table entry) alive until gRPC asynchronously
+                // delivers OnCancel/OnDone. Finish() blocks until the server
+                // has fully closed the RPC (its OnDone run, entry evicted), so
+                // by the time stop() joins this thread the old subscriber entry
+                // is gone — otherwise the next re-dial's `waitUntil(connected)`
+                // can briefly observe the stale, dying reactor as connected and
+                // push a frame into a table that then empties before the fresh
+                // generation registers (a dropped-frame race).
+                //
+                // This must run even when stop_ ended the loop WITHOUT a broken
+                // read (e.g. right after a frame was delivered and the loop
+                // re-armed): that path used to skip Finish and leave eviction to
+                // a lagging async OnCancel, which is exactly the race above.
+                ctx->set_deadline(std::chrono::system_clock::now()
+                                  + kFinishTimeout);
+                // Consume any frames the server is still flushing as it closes,
+                // holding the drain until it has really shut the stream down.
+                autoDiscovery::ParticipantData scratch;
+                while (stream->Read(&scratch)) {}
+                stream->Finish();  // drain to server Done; status discarded
                 {
                     std::lock_guard<std::mutex> lock(ctxMutex_);
                     activeCtx_ = nullptr;

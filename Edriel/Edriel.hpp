@@ -263,6 +263,15 @@ private:
     /// these drive which publishers this node dials.
     std::set<std::string> reliableSubscribedTopics_;
 
+    /// Publishers whose stream was freshly established and whose receive
+    /// windows are therefore to be re-baselined on their next frame. Guards
+    /// against a window that only comes into existence AFTER the reconnect
+    /// (e.g. a late, brand-new subscriber): such a window is created empty with
+    /// the default nextExpected=1 and would otherwise buffer — never deliver —
+    /// a first frame whose tid is behind an unreachable gap. Guarded by
+    /// stateMutex_.
+    std::set<std::uint64_t> reliableFreshPublishers_;
+
     /// Subscriber-client connections (this node dialing publishers).
     mutable std::mutex reliableConnMutex_;
     std::map<SubscriberKey, std::unique_ptr<ReliableSubscriberConnection>>
@@ -634,6 +643,21 @@ public:
      * reliable_data) are ignored. Internal, called by ReliableSubscriberConnection.
      */
     void handleReliableDataFrame(const autoDiscovery::ParticipantData& pd);
+
+    /**
+     * @brief Notifies the receiver that a fresh reliable stream from a
+     *        publisher was just established.
+     *
+     * Called by ReliableSubscriberConnection immediately after it opens a new
+     * dial to a publisher (Write(identity) succeeded). A teardown/reconnect is
+     * an explicit loss boundary: every per-(publisher,topic) receive window for
+     * that publisher is left behind a gap that can never fill (this layer has
+     * no NACK/replay policy), so each such window is reset to an "unbaselined"
+     * state and the next frame received on the fresh stream baselines it.
+     * Without this, frames dropped mid-teardown would leave the window stalled
+     * forever, silently swallowing every later frame for the topic.
+     */
+    void noteReliableStreamEstablished(std::uint64_t publisherUid);
 
     // ========================================================================
     // Public API: Topic Registration (C++20 templates)

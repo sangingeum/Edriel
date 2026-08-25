@@ -1101,7 +1101,30 @@ void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {
     std::vector<autoDiscovery::DataMessage> toDispatch;
     {
         std::lock_guard<std::mutex> lock(stateMutex);
+        // A fresh publisher stream was just established; its first frame must
+        // baseline every window (the transport's prior in-flight frames are
+        // gone, so an unreachable gap would otherwise stall the window). Consume
+        // the marker here — even for a window that is only coming into existence
+        // on this very frame, so it starts unbaselined instead of at its default
+        // nextExpected=1.
+        const bool wasFresh = reliableFreshPublishers_.erase(pubUid);
+        if (wasFresh) {
+            const std::string freshPrefix = std::to_string(pubUid) + "|";
+            for (auto& fkv : reliableWindows_) {
+                if (fkv.first.rfind(freshPrefix, 0) == 0) {
+                    fkv.second.buffer.clear();
+                    fkv.second.nextExpected = 0;
+                }
+            }
+        }
         ReliableRxWindow& w = reliableWindows_[winKey];
+        if (wasFresh) {
+            // Ensure the window itself is unbaselined even when it is only now
+            // being created (a fresh, never-yet-data subscriber's first frame):
+            // the reset loop above cannot see an entry that does not exist yet.
+            w.buffer.clear();
+            w.nextExpected = 0;
+        }
 
         const auto deliver = [&](autoDiscovery::DataMessage& m) {
             toDispatch.push_back(std::move(m));
@@ -1127,7 +1150,16 @@ void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {
             }
         };
 
-        if (tid == w.nextExpected) {
+        if (w.nextExpected == 0) {
+            // A freshly established (re-established) stream: no frame of this
+            // connection can be in flight behind this one, so it baselines the
+            // window. This is the resume-after-reconnect catch-up — frames
+            // dropped mid-teardown can never be replayed, so start the window
+            // at this frame; anything with a smaller tid is unreachable and
+            // dropped (bounded at-most-once).
+            w.nextExpected = tid;
+            deliver(data);
+        } else if (tid == w.nextExpected) {
             deliver(data);
         } else if (tid > w.nextExpected) {
             if ((tid - w.nextExpected) < kReliableWindowSize
@@ -1166,6 +1198,26 @@ void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {
 
     for (autoDiscovery::DataMessage& m : toDispatch) {
         handleDataMessageReceive(m);
+    }
+}
+
+void Edriel::noteReliableStreamEstablished(std::uint64_t publisherUid) {
+    // A fresh dial to `publisherUid` tore down whatever the prior stream was
+    // buffering (the transport is gone, so any un-delivered frames behind it
+    // are lost — no NACK/replay layer exists). Reset every receive window this
+    // node keeps for that publisher to an "unbaselined" state so the first
+    // frame on the new stream re-baselines it, instead of leaving the window
+    // permanently stalled on an unreachable gap.
+    std::lock_guard<std::mutex> lock(stateMutex);
+    // Mark the publisher fresh so a window that only comes into existence on a
+    // later frame (late/never-yet-data subscriber) still starts unbaselined.
+    reliableFreshPublishers_.insert(publisherUid);
+    const std::string prefix = std::to_string(publisherUid) + "|";
+    for (auto& kv : reliableWindows_) {
+        if (kv.first.rfind(prefix, 0) == 0) {
+            kv.second.buffer.clear();
+            kv.second.nextExpected = 0;
+        }
     }
 }
 
