@@ -209,6 +209,8 @@ TEST(Benchmark, ThroughputMsgsPerSecond) {
 
     const int64_t got = receivedCount.load();
     const int64_t lost = sent - got;
+    // ADR-003 decision #4: ring-overflow drops are never silent.
+    const std::uint64_t ringDropped = counterNode.node->droppedFrames();
     const double lostPct =
         (sent > 0) ? 100.0 * static_cast<double>(lost)
                                / static_cast<double>(sent)
@@ -222,10 +224,12 @@ TEST(Benchmark, ThroughputMsgsPerSecond) {
     const double recvByteRate = recvRate * static_cast<double>(kPayloadBytes);
     std::printf(
         "[bench] throughput (%zuB payload): sent=%lld (%.0f msgs/s, %.0f B/s)  "
-        "received=%lld (%.0f msgs/s, %.0f B/s)  lost=%lld (%.2f%%)\n",
+        "received=%lld (%.0f msgs/s, %.0f B/s)  lost=%lld (%.2f%%)  "
+        "ring_dropped=%llu\n",
         kPayloadBytes, static_cast<long long>(sent), sentRate, sentByteRate,
         static_cast<long long>(got), recvRate, recvByteRate,
-        static_cast<long long>(lost), lostPct);
+        static_cast<long long>(lost), lostPct,
+        static_cast<unsigned long long>(ringDropped));
     std::fflush(stdout);
 
     EXPECT_GT(sent, 0);
@@ -313,6 +317,9 @@ TEST(Benchmark, TwoNodeReceiveThroughput) {
 
     const int64_t got = receivedCount.load();
     const int64_t lost = sent - got;
+    // ADR-003 decision #4: ring-overflow drops are never silent — surface the
+    // observable drop-oldest counter (consumer shard rings) in the report.
+    const std::uint64_t ringDropped = consumer.node->droppedFrames();
     const double lostPct =
         (sent > 0) ? 100.0 * static_cast<double>(lost)
                                / static_cast<double>(sent)
@@ -330,11 +337,12 @@ TEST(Benchmark, TwoNodeReceiveThroughput) {
     std::printf(
         "[bench] two-node receive-only (%zuB payload, %lld published): "
         "producer %.0f msgs/s (%.0f B/s)  consumer received=%lld (%.0f "
-        "msgs/s, %.0f B/s)  lost=%lld (%.2f%%)\n",
+        "msgs/s, %.0f B/s)  lost=%lld (%.2f%%)  ring_dropped=%llu\n",
         kPayloadBytes, static_cast<long long>(sent),
         sentRate, sentByteRate,
         static_cast<long long>(got), recvRate, recvByteRate,
-        static_cast<long long>(lost), lostPct);
+        static_cast<long long>(lost), lostPct,
+        static_cast<unsigned long long>(ringDropped));
     std::fflush(stdout);
 
     // Real assertion, not a smoke check: the decoupled consumer must receive a

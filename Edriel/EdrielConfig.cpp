@@ -19,6 +19,7 @@
 #include <cstddef>    // std::size_t
 #include <fstream>    // std::ifstream
 #include <iterator>   // std::istreambuf_iterator
+#include <limits>     // std::numeric_limits
 #include <string_view> // std::string_view
 
 namespace edriel {
@@ -66,6 +67,37 @@ std::size_t parseMaxEndpoints(const std::string& value, std::size_t fallback) {
     }
     if (parsed >= kMaxAdvertisedEndpointsCap) {
         return kMaxAdvertisedEndpointsCap;
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
+std::uint32_t parseCountRange(const std::string& value,
+                              std::uint32_t min, std::uint32_t max,
+                              std::uint32_t fallback) {
+    unsigned long parsed = 0;
+    const char* begin = value.data();
+    const char* end = begin + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed, 10);
+
+    // Strict: a single decimal integer inside [min, max] (no sign, whitespace,
+    // or trailing junk). Any deviation -> fallback.
+    if (ec != std::errc{} || ptr != end ||
+        parsed < min || parsed > max) {
+        return fallback;
+    }
+    return static_cast<std::uint32_t>(parsed);
+}
+
+std::size_t parseRingSlots(const std::string& value, std::size_t fallback) {
+    unsigned long long parsed = 0;
+    const char* begin = value.data();
+    const char* end = begin + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed, 10);
+
+    // Strict power of two: single decimal, no junk, >= 2, and a single bit set.
+    if (ec != std::errc{} || ptr != end || parsed < 2 ||
+        (parsed & (parsed - 1)) != 0) {
+        return fallback;
     }
     return static_cast<std::size_t>(parsed);
 }
@@ -207,6 +239,55 @@ Config loadConfig(const std::string& configPath) {
             }
         } else {
             config.fellBackToDefaults = true;      // missing max_advertised_endpoints key
+        }
+        // ADR-003 sharded receive-pipeline keys (strict per-key validation).
+        // An ABSENT key keeps its default without flagging a fallback (like
+        // `advertise_address`/`peers`); only a present-but-invalid value does.
+        if (const YAML::Node rcvrNode = root["receiver_threads"];
+            rcvrNode && rcvrNode.IsScalar()) {
+            const std::uint32_t sentinel = 0;  // 0 never valid
+            const std::uint32_t parsed = parseCountRange(
+                rcvrNode.as<std::string>(), kMinReceiverThreads,
+                kMaxReceiverThreads, sentinel);
+            if (parsed != 0) {
+                config.receiverThreads = parsed;
+            } else {
+                config.fellBackToDefaults = true;  // invalid -> default kept
+            }
+        }
+        if (const YAML::Node workNode = root["worker_threads"];
+            workNode && workNode.IsScalar()) {
+            const std::uint32_t sentinel = 0;  // 0 never valid
+            const std::uint32_t parsed = parseCountRange(
+                workNode.as<std::string>(), kMinWorkerThreads,
+                kMaxWorkerThreads, sentinel);
+            if (parsed != 0) {
+                config.workerThreads = parsed;
+            } else {
+                config.fellBackToDefaults = true;  // invalid -> default kept
+            }
+        }
+        if (const YAML::Node ringNode = root["rx_ring_slots"];
+            ringNode && ringNode.IsScalar()) {
+            const std::size_t sentinel = 0;  // 0 never valid
+            const std::size_t parsed =
+                parseRingSlots(ringNode.as<std::string>(), sentinel);
+            if (parsed != 0) {
+                config.rxRingSlots = parsed;
+            } else {
+                config.fellBackToDefaults = true;  // invalid -> default kept
+            }
+        }
+        if (const YAML::Node rcvNode = root["so_rcvbuf_bytes"];
+            rcvNode && rcvNode.IsScalar()) {
+            const std::uint32_t sentinel = std::numeric_limits<std::uint32_t>::max();
+            const std::uint32_t parsed = parseCountRange(
+                rcvNode.as<std::string>(), 0, kMaxSoRcvbufBytes, sentinel);
+            if (parsed != sentinel) {
+                config.soRcvbufBytes = parsed;
+            } else {
+                config.fellBackToDefaults = true;  // invalid -> default kept
+            }
         }
         if (const YAML::Node advNode = root["advertise_address"]; advNode) {
             // Accept a scalar (one address) or a sequence (multi-homed). An

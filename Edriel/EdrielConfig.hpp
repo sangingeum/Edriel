@@ -40,6 +40,32 @@ inline constexpr std::size_t kDefaultMaxAdvertisedEndpoints{ 4 };
 /// Sanity ceiling for `max_advertised_endpoints` (avoids pathological growth).
 inline constexpr std::size_t kMaxAdvertisedEndpointsCap{ 64 };
 
+// ---------------------------------------------------------------------------
+// ADR-003 sharded SPSC receive-pipeline knobs (and their per-key fallbacks).
+// ---------------------------------------------------------------------------
+
+/// Default number of receiver threads that drain the UDP multicast receive
+/// path. ADR-003 decision #5 keeps this at 1 in v1 (loopback has a single
+/// kernel RX queue); accepted and validated but not run >1 yet. Invalid/out of
+/// range -> 1.
+inline constexpr std::uint32_t kDefaultReceiverThreads{ 1 };
+/// Floor/ceiling for `receiver_threads` per the ADR-003 table ([1, 4]).
+inline constexpr std::uint32_t kMinReceiverThreads{ 1 };
+inline constexpr std::uint32_t kMaxReceiverThreads{ 4 };
+/// Default shard/worker count (SPSC rings + registry shards). ADR-003: this is
+/// the true parallel lever (`N`). Invalid/out-of-range -> 4.
+inline constexpr std::uint32_t kDefaultWorkerThreads{ 4 };
+/// Floor/ceiling for `worker_threads` per the ADR-003 table ([1, 16]).
+inline constexpr std::uint32_t kMinWorkerThreads{ 1 };
+inline constexpr std::uint32_t kMaxWorkerThreads{ 16 };
+/// Default per-worker bounded SPSC ring capacity (slots), a power of two.
+/// Invalid/non-power-of-two -> 4096.
+inline constexpr std::size_t kDefaultRxRingSlots{ 4096 };
+/// `so_rcvbuf_bytes` of zero means "leave the OS default" (0x sentinel).
+inline constexpr std::uint32_t kDefaultSoRcvbufBytes{ 0 };
+/// Upper bound for `so_rcvbuf_bytes` (1 << 30) per the ADR-003 table.
+inline constexpr std::uint32_t kMaxSoRcvbufBytes{ 1u << 30 };
+
 /**
  * @struct Config
  * @brief Validated auto-discovery endpoint and cadence configuration.
@@ -76,6 +102,23 @@ struct Config {
     /// Invalid/0 -> 4; clamped to kMaxAdvertisedEndpointsCap.
     std::size_t maxAdvertisedEndpoints = kDefaultMaxAdvertisedEndpoints;
 
+    // -----------------------------------------------------------------------
+    // ADR-003 sharded SPSC receive-pipeline knobs.
+    // -----------------------------------------------------------------------
+    /// Socket-draining threads ([1,4], default 1). ADR-003 keeps v1 at 1; a
+    /// >1 value is accepted/validated but not yet run (loopback has one kernel
+    /// RX queue, so the parallelism lever is worker_threads).
+    std::uint32_t receiverThreads = kDefaultReceiverThreads;
+    /// Shard/ring/worker count `N` ([1,16], default 4). The true parallel
+    /// lever: each worker owns exactly one SPSC ring + registry shard.
+    std::uint32_t workerThreads = kDefaultWorkerThreads;
+    /// Slots per worker's bounded SPSC ring (power of two, default 4096).
+    /// The userland drop buffer that makes kernel overruns observable.
+    std::size_t rxRingSlots = kDefaultRxRingSlots;
+    /// SO_RCVBUF in bytes on the UDP receive socket ([0, 1<<30], default 0 =
+    /// leave the OS default). Tuned once a baseline exists.
+    std::uint32_t soRcvbufBytes = kDefaultSoRcvbufBytes;
+
     /// True when one or more config.yml keys were missing or invalid and a
     /// default was substituted (diagnostics only). Also drives the
     /// constructor's fallback notice.
@@ -106,6 +149,23 @@ std::size_t parseMaxEndpoints(const std::string& value,
                               std::size_t fallback = kDefaultMaxAdvertisedEndpoints);
 
 /**
+ * @brief Parse an integer drawn from the inclusive range [min, max].
+ * Returns `fallback` for anything that is not a strict decimal integer in the
+ * range (empty, non-numeric, trailing junk, overflow, out-of-range).
+ */
+std::uint32_t parseCountRange(const std::string& value,
+                              std::uint32_t min, std::uint32_t max,
+                              std::uint32_t fallback);
+
+/**
+ * @brief Parse the per-worker ring slot count. Returns `fallback` unless the
+ *        value is a strict power-of-two whole number (the ADR-003 table
+ *        requires a power of two, so the mask-based fast path is exact).
+ */
+std::size_t parseRingSlots(const std::string& value,
+                           std::size_t fallback = kDefaultRxRingSlots);
+
+/**
  * @brief Parse an IPv4 multicast address. Returns `fallback` unless `value` is
  *        a strict dotted-quad address in the multicast range 224.0.0.0 .. 239.255.255.255.
  */
@@ -119,10 +179,13 @@ std::string parseMulticastAddress(const std::string& value,
  * (integer seconds), `participant_timeout_seconds` (integer seconds),
  * `grpc_port` (integer; reliable-path listener), `advertise_address`
  * (scalar or list of unicast addresses), `peers` (scalar or list of static
- * "address:port" seeds for multicast-blind subscribers), and
- * `max_advertised_endpoints` (integer cap). Each missing or invalid key falls
- * back to its default independently; a missing or unparseable file also yields
- * the defaults. Never throws on config content.
+ * "address:port" seeds for multicast-blind subscribers),
+ * `max_advertised_endpoints` (integer cap), `receiver_threads` (integer,
+ * ADR-003), `worker_threads` (integer, ADR-003), `rx_ring_slots` (integer
+ * power of two, ADR-003), and `so_rcvbuf_bytes` (integer, ADR-003). Each
+ * missing or invalid key falls back to its default independently; a missing
+ * or unparseable file also yields the defaults. Never throws on config
+ * content.
  */
 Config loadConfig(const std::string& configPath = "config.yml");
 

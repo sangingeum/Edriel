@@ -42,6 +42,7 @@
 
 # build outputs
 out
+.build_*
 build
 build_setup
 build_strict

@@ -28,6 +28,7 @@
 #include <ifaddrs.h>    // getifaddrs (interface discovery)
 #include <netinet/in.h> // sockaddr_in
 #include <arpa/inet.h>  // ntohl, AF_INET on POSIX
+#include <sys/time.h>   // struct timeval (SO_RCVTIMEO)
 #endif
 
 #include <cstdint>  // std::uint8_t / std::uint32_t
@@ -40,6 +41,35 @@ namespace edriel {
 
 /// Expected magic number for packet integrity verification
 constexpr uint32_t MAGIC_NUMBER_VALUE = 0xED75E1ED;
+
+namespace {
+
+/// Give the multicast receive socket a soft receive timeout so the dedicated
+/// receiver thread wakes periodically even when idle. This is the shutdown
+/// liveness mechanism: closing the socket from another thread does NOT
+/// reliably unblock a thread stuck in a blocking asio `receive_from`, so
+/// unless we bound the wait, the receiver-thread join at teardown could hang.
+/// A short timeout costs nothing here (no data -> EAGAIN -> loop) and makes
+/// shutdown deterministic. Platform-guarded (timeval on POSIX, DWORD ms on
+/// Windows).
+void setSocketReceiveTimeout(asio::ip::udp::socket& sock, unsigned long ms) {
+#if defined(_WIN32)
+    const DWORD timeoutMs = static_cast<DWORD>(ms);
+    ::setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+#else
+    struct timeval tv;
+    tv.tv_sec = static_cast<long>(ms / 1000);
+    tv.tv_usec = static_cast<long>((ms % 1000) * 1000);
+    ::setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+/// Receiver wakeup cadence (ms) — the idle loop polls this often; shutdown is
+/// observed within ~this interval.
+constexpr unsigned long kReceiverPollMs = 300;
+
+}  // namespace
 
 // ============================================================================
 // Helper Functions
@@ -294,6 +324,31 @@ Edriel::Edriel(asio::io_context& io_ctx, const Config& config)
                                      asio::ip::make_address_v4(config_.multicastAddress)));
     autoDiscoverySocket->set_option(asio::ip::multicast::enable_loopback(true));
     autoDiscoverySocket->bind(receiverEndpoint);
+    // ADR-003: raise the kernel receive buffer so the socket can hold a burst
+    // between drain arms. 0 (= default config) leaves the OS default untouched.
+    if (config_.soRcvbufBytes > 0) {
+        autoDiscoverySocket->set_option(
+            asio::socket_base::receive_buffer_size(config_.soRcvbufBytes));
+    }
+    // Bound the receiver thread's blocking receive so shutdown is observable
+    // even if the socket close doesn't unblock it (deterministic teardown).
+    setSocketReceiveTimeout(*autoDiscoverySocket, kReceiverPollMs);
+
+    // Initialize the ADR-003 sharded pipeline: `worker_threads` shards, each
+    // with its own bounded SPSC ring. Worker threads are launched on
+    // startAutoDiscovery(), not here.
+    workerCount_ = static_cast<std::size_t>(config_.workerThreads);
+    if (workerCount_ < kMinWorkerThreads || workerCount_ > kMaxWorkerThreads) {
+        workerCount_ = kDefaultWorkerThreads;  // defensive clamp (config validated)
+    }
+    shards_.reserve(workerCount_);
+    for (std::size_t i = 0; i < workerCount_; ++i) {
+        auto shard = std::make_unique<Shard>();
+        shard->ring = std::make_unique<SpscRing<autoDiscovery::Message>>(
+            config_.rxRingSlots > 0 ? config_.rxRingSlots
+                                    : kDefaultRxRingSlots);
+        shards_.push_back(std::move(shard));
+    }
 
     // Initialize self participant: real pid + a process-unique uid so two
     // nodes never collapse into the same registry identity.
@@ -335,14 +390,19 @@ Edriel::~Edriel() {
  * Sets up socket options, starts send/receive timers, and configures the endpoint.
  */
 void Edriel::initializeAutoDiscovery() {
+    // Flag running BEFORE spawning the receiver/worker threads: the receiver
+    // loop exits unless isRunning is already true when it first samples it.
+    isRunning = true;
+
     // Start send timer
     autoDiscoverySendTimer->expires_after(config_.discoverySendPeriod);
     
     // Start cleanup timer
     autoDiscoveryCleanUpTimer->expires_after(autoDiscoveryCleanupPeriod());
     
-    // Start receivers
-    startAutoDiscoveryReceiver();
+    // Start the ADR-003 sharded receive pipeline (socket-drain + workers) and
+    // the periodic send/cleaner timers (these keep running on the io strand).
+    startReceivePipeline();
     startAutoDiscoverySender();
     startAutoDiscoveryCleaner();
 
@@ -350,44 +410,170 @@ void Edriel::initializeAutoDiscovery() {
     // advertised endpoints (ADR-0002). Additive; a port conflict is logged and
     // the multicast plane is unaffected.
     startGrpcServer();
-    
-    // Set running flag
-    isRunning = true;
 }
 
-/**
- * @brief Starts the auto-discovery receiver loop
- * 
- * Listens for incoming multicast packets and handles discovery messages.
- * 
- * @param buffer Optional buffer (uses default if not provided)
- */
-void Edriel::startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer) {
-    if (!buffer) {
-        buffer = std::make_shared<Buffer>();
+// ============================================================================
+// ADR-003 sharded receive pipeline: routing + receiver/worker threads
+// ============================================================================
+
+std::size_t Edriel::workerCount() const {
+    return workerCount_;
+}
+
+std::size_t Edriel::shardIndexForTopic(const std::string& compositeKey) const {
+    // One topic -> one shard -> one worker (ADR-003 decision #2). N==1 short-
+    // circuits to 0 so the single-shard path needs no hashing at all.
+    return (workerCount_ <= 1) ? 0 : (fnv1a64(compositeKey) % workerCount_);
+}
+
+std::size_t Edriel::shardIndexForUid(std::uint64_t uid) const {
+    // Peer registry is sliced by uid alone (ADR-003 decision #1).
+    return (workerCount_ <= 1) ? 0
+                               : (fnv1a64(std::to_string(uid)) % workerCount_);
+}
+
+Edriel::Shard& Edriel::shardRef(std::size_t index) {
+    return *shards_.at(index);
+}
+
+const Edriel::Shard& Edriel::shardRef(std::size_t index) const {
+    return *shards_.at(index);
+}
+
+std::map<std::string, Edriel::TopicEntry> Edriel::mergeRegistrySnapshot() const {
+    std::map<std::string, TopicEntry> merged;
+    // Lock one shard at a time in ascending index order (no nested shard locks).
+    for (const auto& shard : shards_) {
+        std::lock_guard<std::mutex> lock(shard->mux);
+        merged.insert(shard->topics.begin(), shard->topics.end());
     }
+    return merged;
+}
 
-    // Registry mutations are serialized on this object's strand so concurrent
-    // completions (multi-threaded io_context) cannot race the std::set/map.
+std::set<Edriel::Participant> Edriel::mergeParticipantSnapshot() const {
+    std::set<Participant> merged;
+    for (const auto& shard : shards_) {
+        std::lock_guard<std::mutex> lock(shard->mux);
+        for (const auto& kv : shard->participants) {
+            merged.insert(kv.second);
+        }
+    }
+    return merged;
+}
+
+void Edriel::ageParticipant(std::uint64_t uid) {
+    Shard& shard = shardRef(shardIndexForUid(uid));
+    std::lock_guard<std::mutex> lock(shard.mux);
+    const auto it = shard.participants.find(uid);
+    if (it != shard.participants.end()) {
+        it->second.lastSeen -= std::chrono::hours(24);
+    }
+}
+
+void Edriel::startReceivePipeline() {
+    if (pipelineStarted_) {
+        return;
+    }
+    pipelineStarted_ = true;
+    // Worker threads: one per shard/ring.
+    for (std::size_t i = 0; i < workerCount_; ++i) {
+        shards_[i]->worker = std::thread(&Edriel::autoDiscoveryWorkerLoop, this, i);
+    }
+    // Receiver (socket-drain) thread. ADR-003 keeps receiver_threads=1 in v1.
+    // Arm the async receive first (queued on receiverIo_), then run it.
+    armAutoDiscoveryReceive();
+    receiverThread_ = std::thread(&Edriel::autoDiscoveryReceiverLoop, this);
+}
+
+void Edriel::stopReceivePipeline() {
+    if (!pipelineStarted_) {
+        return;
+    }
+    pipelineStarted_ = false;
+    // Wake every worker and let it drain its ring, then leave it.
+    for (auto& shard : shards_) {
+        shard->ring->close();
+    }
+    for (auto& shard : shards_) {
+        if (shard->worker.joinable()) {
+            shard->worker.join();
+        }
+    }
+    // The socket was already closed by stopAutoDiscovery, which cancelled the
+    // pending async_receive; receiverIo_.run() then returns and the thread
+    // exits, so join() completes deterministically.
+    if (receiverThread_.joinable()) {
+        receiverThread_.join();
+    }
+}
+
+void Edriel::autoDiscoveryReceiverLoop() {
+    receiverIo_.run();
+}
+
+void Edriel::armAutoDiscoveryReceive() {
     autoDiscoverySocket->async_receive(
-        asio::buffer(buffer->data(), recvBufferSize),
-        asio::bind_executor(strand,
-            [this, buffer](const asio::error_code& ec, std::size_t bytesTransferred) {
-                if (!ec && bytesTransferred > 0) {
-                    if (hasValidMagicNumber(buffer, bytesTransferred)) {
-                        handleAutoDiscoveryReceive(buffer, ec, bytesTransferred);
-                    }
-                }
+        asio::buffer(receiverBuffer_.data(), recvBufferSize),
+        [this](const asio::error_code& ec, std::size_t n) {
+            if (ec) {
+                // Aborted (socket closed during shutdown) or a real error:
+                // stop re-arming so receiverIo_.run() returns and the thread
+                // exits. Don't hot-loop on a wedged socket.
+                return;
+            }
+            handleReceivedDatagram(n);
+            if (isRunning.load(std::memory_order_relaxed)) {
+                armAutoDiscoveryReceive();  // re-arm immediately (fast drain)
+            }
+        });
+}
 
-                // Keep listening. On abort (socket closed during shutdown) or
-                // a closed socket the re-arm would spin the io_context forever
-                // (bad-fd completes immediately), so stop instead.
-                if (ec == asio::error::operation_aborted || !isRunning
-                    || !autoDiscoverySocket->is_open()) {
-                    return;
-                }
-                startAutoDiscoveryReceiver(buffer);
-            }));
+void Edriel::handleReceivedDatagram(std::size_t bytesTransferred) {
+    if (bytesTransferred < magicNumberSize) {
+        return;
+    }
+    // Validate the magic number (memcpy to avoid unaligned access).
+    std::uint32_t networkMagic = 0;
+    std::memcpy(&networkMagic, receiverBuffer_.data(), sizeof(networkMagic));
+    if (ntohl(networkMagic) != MAGIC_NUMBER_VALUE) {
+        return;
+    }
+    // Parse just enough to route by topic (or by uid for a bare heartbeat).
+    // The payload decode + dispatch happen on the owning worker.
+    autoDiscovery::Message msg;
+    if (!msg.ParseFromArray(
+            receiverBuffer_.data() + static_cast<std::ptrdiff_t>(magicNumberSize),
+            bytesTransferred - magicNumberSize)) {
+        return;
+    }
+    Shard* target = nullptr;
+    if (msg.has_identifier()) {
+        const auto& id = msg.identifier();
+        target = &shardRef(shardIndexForUid(id.uid()));
+    } else if (msg.has_data_message()) {
+        const auto& d = msg.data_message();
+        target = &shardRef(shardIndexForTopic(
+            makeCompositeKey(d.topic_name(), d.message_type())));
+    } else if (msg.has_advertisement()) {
+        const auto& ad = msg.advertisement();
+        target = &shardRef(shardIndexForTopic(
+            makeCompositeKey(ad.topic().topic_name(), ad.topic().message_type())));
+    }
+    if (target == nullptr) {
+        return;  // unrecognized oneof; drop
+    }
+    target->ring->publish(std::make_unique<autoDiscovery::Message>(std::move(msg)));
+}
+
+void Edriel::autoDiscoveryWorkerLoop(std::size_t shardIndex) {
+    SpscRing<autoDiscovery::Message>* ring = shards_.at(shardIndex)->ring.get();
+    while (true) {
+        auto msg = ring->pop();
+        if (!msg) {
+            break;  // ring closed and drained
+        }
+        handleAutoDiscoveryParse(*msg);
+    }
 }
 
 void Edriel::postOnStrand(std::function<void()> thunk) {
@@ -489,54 +675,37 @@ std::chrono::seconds Edriel::autoDiscoveryCleanupPeriod() const {
 // ============================================================================
 
 /**
- * @brief Handles received auto-discovery packets
- * 
- * Parses the discovery message, extracts participant information,
- * and registers or updates participants in the registry.
- * 
- * @param buffer Shared pointer to receive buffer
- * @param ec ASIO error code
- * @param bytesTransferred Number of bytes received
- */
-void Edriel::handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer, 
-                                        const asio::error_code& ec, 
-                                        std::size_t bytesTransferred) {
-    if (ec || bytesTransferred == 0) {
-        return;
-    }
-    
-    // Parse discovery message
-    autoDiscovery::Message receivedMessage;
-    if (!receivedMessage.ParseFromArray(buffer->data() + magicNumberSize, 
-                                        bytesTransferred - magicNumberSize)) {
-        // Failed to parse protobuf message
-        return;
-    }
-    handleAutoDiscoveryParse(receivedMessage);
-}
-
-/**
- * @brief Dispatches a parsed discovery message by content type (oneof)
+ * @brief Dispatches a parsed discovery message by content type (oneof).
+ *
+ * Runs on each worker for ring-popped frames, and on the calling thread for
+ * the direct test hook. Every branch routes to the owning shard. Note the
+ * ADR-003 heartbeat micro-opt: only a STANDALONE heartbeat frame (a bare
+ * `identifier`) refreshes the peer registry. Data and advertisement frames
+ * no longer bump the publisher's `lastSeen`/endpoints on every delivery — a
+ * fast O(1) peer refresh (once per peer per 2s heartbeat) replaces the old
+ * per-frame O(n) find + per-frame endpoint-rebuild on the multicast hot path.
+ * Peers stay alive through their own heartbeat stream; losing the per-data
+ * heartbeat does not reduce per-(publisher,topic) delivery order or reliability.
  *
  * @param receivedMessage Parsed protobuf message
  */
 void Edriel::handleAutoDiscoveryParse(const autoDiscovery::Message& receivedMessage) {
     // Handle based on message content type (oneof)
     if (receivedMessage.has_identifier()) {
-
         const auto& id = receivedMessage.identifier();
         handleParticipantHeartbeat(id.pid(), id.tid(), id.uid(),
                                    collectEndpoints(id));
     } else if (receivedMessage.has_data_message()) {
         const auto& data = receivedMessage.data_message();
-        const auto& id = data.identifier();
-        handleParticipantHeartbeat(id.pid(), id.tid(), id.uid(),
-                                   collectEndpoints(id));
         handleDataMessageReceive(data);
     } else if (receivedMessage.has_advertisement()) {
         const auto& ad = receivedMessage.advertisement();
         const auto& id = ad.identifier();
         const auto& topic = ad.topic();
+        // Advertisements are infrequent (one per topic registration / peer
+        // announcement, NOT per data frame), so registering the announcing
+        // peer here is cheap and carries its advertised endpoints (needed by
+        // the reliable path's reconcile to dial it).
         handleParticipantHeartbeat(id.pid(), id.tid(), id.uid(),
                                    collectEndpoints(id));
         handleTopicAnnouncement(
@@ -565,33 +734,26 @@ void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_
         return;
     }
 
-    std::lock_guard<std::mutex> lock(stateMutex);
+    // O(1) registry (ADR-003 decision #1): the peer lives in shard hash(uid)%N,
+    // keyed by `uid` alone. No linear scan, no 3-field compare.
+    Shard& shard = shardRef(shardIndexForUid(uid));
+    std::lock_guard<std::mutex> lock(shard.mux);
 
-    // Check if participant already exists
-    auto it = std::find_if(
-        participants.begin(),
-        participants.end(),
-        [pid, tid, uid](const Participant& p) {
-            return p.pid == pid && p.tid == tid && p.uid == uid;
-        });
-
-    if (it == participants.end()) {
+    auto it = shard.participants.find(uid);
+    if (it == shard.participants.end()) {
         // New participant, create entry with the configured aliveness timeout.
         Participant newParticipant(pid, tid, uid, config_.participantTimeout);
-
-        // Set initial timestamp
         newParticipant.lastSeen = std::chrono::steady_clock::now();
         // Adopt the advertised endpoints from this first heartbeat.
         newParticipant.endpoints = std::move(endpoints);
-
-        participants.insert(newParticipant);
+        shard.participants.emplace(uid, std::move(newParticipant));
     } else {
         // Existing participant, update timestamp.
-        it->updateLastSeen();
+        it->second.updateLastSeen();
         // Refresh advertised endpoints every heartbeat (ADR-0002): a restarted
         // peer re-advertises on its first heartbeat; a moved IP overwrites the
         // list in place. Idempotent and ~µs.
-        it->endpoints = std::move(endpoints);
+        it->second.endpoints = std::move(endpoints);
     }
 }
 
@@ -602,33 +764,65 @@ void Edriel::handleParticipantHeartbeat(unsigned long pid, uint64_t tid, uint64_
  * period has elapsed since the last heartbeat.
  */
 void Edriel::removeTimedOutParticipants() {
-    std::lock_guard<std::mutex> lock(stateMutex);
-
-    // Find participants to remove
-    auto it = participants.begin();
-    while (it != participants.end()) {
-        if (it->shouldBeRemoved()) {
-            const Participant stale = *it;
-
-            // Stale topic purge: drop this participant from every registry
-            // entry so a peer that times out no longer appears as a publisher
-            // or subscriber of any topic.
-            for (auto& kv : topicRegistry) {
-                TopicEntry& entry = kv.second;
-                entry.publishers.erase(stale);
-                entry.subscribers.erase(stale);
+    // Phase 1: locate and evict stale peers from the sharded participant
+    // registry (lock one shard at a time, ascending; never nested).
+    std::vector<Participant> stale;
+    for (std::size_t i = 0; i < workerCount_; ++i) {
+        Shard& shard = *shards_[i];
+        std::lock_guard<std::mutex> lock(shard.mux);
+        for (auto it = shard.participants.begin(); it != shard.participants.end();) {
+            if (it->second.shouldBeRemoved()) {
+                stale.push_back(it->second);
+                it = shard.participants.erase(it);
+            } else {
+                ++it;
             }
+        }
+    }
 
-            // Remove and advance
-            it = participants.erase(it);
+    // Phase 2: purge every stale peer from all topic-entry publisher/subscriber
+    // sets (a peer with topics on many shards is referenced from each), and
+    // drop topic entries left with no local callbacks and no remote peers.
+    const auto isStale = [&stale](const Participant& p) {
+        for (const Participant& s : stale) {
+            if (s.uid == p.uid) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (std::size_t i = 0; i < workerCount_; ++i) {
+        Shard& shard = *shards_[i];
+        std::lock_guard<std::mutex> lock(shard.mux);
+        for (auto entry = shard.topics.begin(); entry != shard.topics.end();) {
+            for (auto p = entry->second.publishers.begin();
+                 p != entry->second.publishers.end();) {
+                p = isStale(*p) ? entry->second.publishers.erase(p) : std::next(p);
+            }
+            for (auto s = entry->second.subscribers.begin();
+                 s != entry->second.subscribers.end();) {
+                s = isStale(*s) ? entry->second.subscribers.erase(s) : std::next(s);
+            }
+            if (entry->second.publishers.empty()
+                && entry->second.subscribers.empty()
+                && entry->second.callbacks.empty()) {
+                entry = shard.topics.erase(entry);
+            } else {
+                ++entry;
+            }
+        }
+    }
 
-            // Prune this peer's per-(publisher,topic) reliable receiver windows
-            // (ADR-0002 §5 lifecycle: a timed-out participant's endpoints and
-            // streams vanish with it). Without this the windows map grows
-            // without bound as peers cycle through the registry.
-            // reliablePublisherSeq_ is keyed by topic (bounded by topic count),
-            // not per-pub, so it needs no peer-keyed pruning.
-            const std::string winPrefix = std::to_string(stale.uid) + "|";
+    // Phase 3: prune this peer's per-(publisher,topic) reliable receiver
+    // windows (ADR-0002 §5 lifecycle: a timed-out participant's endpoints and
+    // streams vanish with it). Without this the windows map grows without
+    // bound as peers cycle through the registry. reliablePublisherSeq_ is
+    // keyed by topic (bounded by topic count), not per-pub, so it needs no
+    // peer-keyed pruning. Reliable path off the hot path -> own mutex.
+    if (!stale.empty()) {
+        std::lock_guard<std::mutex> lock(reliableMutex_);
+        for (const Participant& s : stale) {
+            const std::string winPrefix = std::to_string(s.uid) + "|";
             auto win = reliableWindows_.begin();
             while (win != reliableWindows_.end()) {
                 if (win->first.rfind(winPrefix, 0) == 0) {
@@ -637,19 +831,6 @@ void Edriel::removeTimedOutParticipants() {
                     ++win;
                 }
             }
-        } else {
-            ++it;
-        }
-    }
-
-    // Drop registry entries left with no local callbacks and no remote peers.
-    for (auto entry = topicRegistry.begin(); entry != topicRegistry.end(); ) {
-        if (entry->second.publishers.empty()
-            && entry->second.subscribers.empty()
-            && entry->second.callbacks.empty()) {
-            entry = topicRegistry.erase(entry);
-        } else {
-            ++entry;
         }
     }
 }
@@ -683,8 +864,12 @@ void Edriel::handleTopicAnnouncement(unsigned long pid,
 
     Participant remote(pid, tid, uid);
 
-    std::lock_guard<std::mutex> lock(stateMutex);
-    TopicEntry& entry = topicRegistry[topicInfo.key];
+    // Announcements are routed by the announcing topic's shard (ADR-003
+    // decision #2: one topic -> one worker). The peer's liveness/normalized
+    // registry entry is maintained by its own heartbeat stream (cheap here).
+    Shard& shard = shardRef(shardIndexForTopic(topicInfo.key));
+    std::lock_guard<std::mutex> lock(shard.mux);
+    TopicEntry& entry = shard.topics[topicInfo.key];
 
     entry.topicName = topicName;
     entry.messageType = messageType;
@@ -694,12 +879,6 @@ void Edriel::handleTopicAnnouncement(unsigned long pid,
     } else {
         entry.subscribers.insert(remote);
     }
-
-    // Drop registry entries with no remaining local interest and no remote peers.
-    if (entry.publishers.empty() && entry.subscribers.empty()
-        && entry.callbacks.empty()) {
-        topicRegistry.erase(topicInfo.key);
-    }
 }
 
 /**
@@ -707,20 +886,23 @@ void Edriel::handleTopicAnnouncement(unsigned long pid,
  *
  * Demuxes by composite key (topic name + message type) and invokes all
  * locally registered typed subscriber callbacks for the topic whose declared
- * message type matches. Callbacks run on this object's strand.
+ * message type matches. Runs on the topic's owning worker (or the calling
+ * thread for the test hook) and locks only that shard.
  *
  * @param data Parsed DataMessage from the wire
  */
 void Edriel::handleDataMessageReceive(const autoDiscovery::DataMessage& data) {
     const std::string key = makeCompositeKey(data.topic_name(), data.message_type());
 
-    // Collect the matching callbacks under the lock, then invoke them after
-    // releasing it so user code (a callback) may safely re-enter the public API.
+    // Collect the matching callbacks under the topic's shard lock, then invoke
+    // them after releasing it so user code (a callback) may safely re-enter the
+    // public API.
+    Shard& shard = shardRef(shardIndexForTopic(key));
     std::vector<TopicEntry::Callback> matched;
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        auto it = topicRegistry.find(key);
-        if (it == topicRegistry.end()) {
+        std::lock_guard<std::mutex> lock(shard.mux);
+        const auto it = shard.topics.find(key);
+        if (it == shard.topics.end()) {
             return;  // No local subscription for this topic
         }
         for (const auto& cb : it->second.callbacks) {
@@ -730,7 +912,10 @@ void Edriel::handleDataMessageReceive(const autoDiscovery::DataMessage& data) {
         }
     }
 
+    // Resolve + decode the payload ONCE per message, then fan out to every
+    // matching callback (ADR-003: removes the old decode-per-callback cost).
     const google::protobuf::Message* prototype = nullptr;
+    std::unique_ptr<google::protobuf::Message> decoded;
     for (auto& cb : matched) {
         if (prototype == nullptr) {
             // Resolve the payload prototype once per message, not once per
@@ -746,11 +931,13 @@ void Edriel::handleDataMessageReceive(const autoDiscovery::DataMessage& data) {
             prototype =
                 google::protobuf::MessageFactory::generated_factory()->GetPrototype(descriptor);
         }
-        std::unique_ptr<google::protobuf::Message> decoded(prototype->New());
-        if (!decoded->ParseFromString(data.payload())) {
-            std::cerr << "[Edriel] Failed to decode payload for topic "
-                      << data.topic_name() << "\n";
-            continue;
+        if (!decoded) {
+            decoded.reset(prototype->New());
+            if (!decoded->ParseFromString(data.payload())) {
+                std::cerr << "[Edriel] Failed to decode payload for topic "
+                          << data.topic_name() << "\n";
+                return;
+            }
         }
         cb.invoke(*decoded);
     }
@@ -858,11 +1045,13 @@ void Edriel::stopAutoDiscovery() {
         autoDiscoveryCleanUpTimer->cancel();
     }
     
-    // Close socket
+    // Close socket (unblocks the dedicated receiver thread), then stop and join
+    // the receive pipeline (receiver + workers).
     if (autoDiscoverySocket && autoDiscoverySocket->is_open()) {
         asio::error_code ec;
         autoDiscoverySocket->close(ec);
     }
+    stopReceivePipeline();
 
     // Tear down subscriber-client connections to publishers (reliable path).
     stopReliableSubscriptions();
@@ -914,13 +1103,20 @@ void Edriel::stopGrpcServer() {
 bool Edriel::lookupParticipantData(std::uint32_t pid, std::uint64_t tid,
                                    std::uint64_t uid,
                                    autoDiscovery::ParticipantData& out) const {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    const auto it = std::find_if(
-        participants.begin(), participants.end(),
-        [pid, tid, uid](const Participant& p) {
-            return p.pid == pid && p.tid == tid && p.uid == uid;
-        });
-    if (it == participants.end()) {
+    // The peer registry is keyed by uid alone, so the peer — if present — lives
+    // in shard hash(uid)%N (O(1)). Cold path (gRPC verify/refresh).
+    const Shard& shard = shardRef(shardIndexForUid(uid));
+    Participant found;
+    bool present = false;
+    {
+        std::lock_guard<std::mutex> lock(shard.mux);
+        const auto it = shard.participants.find(uid);
+        if (it != shard.participants.end()) {
+            found = it->second;
+            present = true;
+        }
+    }
+    if (!present) {
         return false;
     }
 
@@ -928,62 +1124,86 @@ bool Edriel::lookupParticipantData(std::uint32_t pid, std::uint64_t tid,
     out.set_tid(tid);
     out.set_uid(uid);
     out.set_status("online");
-    for (const auto& ep : it->endpoints) {
+    for (const auto& ep : found.endpoints) {
         *out.add_endpoints() = ep;
     }
-    for (const auto& kv : topicRegistry) {
-        const TopicEntry& entry = kv.second;
-        if (entry.publishers.count(*it) != 0) {
-            out.add_topics_published(entry.topicName);
+    // Collect the topics this peer publishes/subscribes to across every shard.
+    std::set<std::string> pubTopics;
+    std::set<std::string> subTopics;
+    for (std::size_t i = 0; i < workerCount_; ++i) {
+        const Shard& s = *shards_[i];
+        std::lock_guard<std::mutex> lock(s.mux);
+        for (const auto& kv : s.topics) {
+            if (kv.second.publishers.count(found) != 0) {
+                pubTopics.insert(kv.second.topicName);
+            }
+            if (kv.second.subscribers.count(found) != 0) {
+                subTopics.insert(kv.second.topicName);
+            }
         }
-        if (entry.subscribers.count(*it) != 0) {
-            out.add_topics_subscribed(entry.topicName);
-        }
+    }
+    for (const std::string& t : pubTopics) {
+        out.add_topics_published(t);
+    }
+    for (const std::string& t : subTopics) {
+        out.add_topics_subscribed(t);
     }
     return true;
 }
 
 std::vector<autoDiscovery::ParticipantData> Edriel::snapshotParticipantData() const {
     std::vector<autoDiscovery::ParticipantData> presence;
-    std::lock_guard<std::mutex> lock(stateMutex);
-    presence.reserve(participants.size());
-    for (const Participant& p : participants) {
-        autoDiscovery::ParticipantData pd;
-        pd.set_pid(static_cast<std::uint32_t>(p.pid));
-        pd.set_tid(p.tid);
-        pd.set_uid(p.uid);
-        pd.set_status("online");
-        for (const auto& ep : p.endpoints) {
-            *pd.add_endpoints() = ep;
+    presence.reserve(workerCount_ * 2);
+    for (std::size_t i = 0; i < workerCount_; ++i) {
+        const Shard& s = *shards_[i];
+        std::lock_guard<std::mutex> lock(s.mux);
+        for (const auto& kv : s.participants) {
+            const Participant& p = kv.second;
+            autoDiscovery::ParticipantData pd;
+            pd.set_pid(static_cast<std::uint32_t>(p.pid));
+            pd.set_tid(p.tid);
+            pd.set_uid(p.uid);
+            pd.set_status("online");
+            for (const auto& ep : p.endpoints) {
+                *pd.add_endpoints() = ep;
+            }
+            presence.push_back(std::move(pd));
         }
-        presence.push_back(std::move(pd));
     }
     return presence;
 }
 
 bool Edriel::isKnownParticipant(std::uint32_t pid, std::uint64_t tid, std::uint64_t uid) {
-    std::lock_guard<std::mutex> lock(stateMutex);
     const auto matches = [pid, tid, uid](const Participant& p) {
         return p.pid == pid && p.tid == tid && p.uid == uid;
     };
-    for (const Participant& p : participants) {
-        if (matches(p)) {
-            return true;
-        }
-    }
-    // A peer that has announced a topic subscription/publish is `known` even
-    // before/cross- the heartbeat path populates `participants`; gate against
-    // both so a genuine topic-peer dial is accepted but a random non-participant
-    // is rejected (ADR-0002 §6.2 anti-spoof).
-    for (const auto& kv : topicRegistry) {
-        for (const Participant& p : kv.second.publishers) {
-            if (matches(p)) {
+    // Scan the sharded participant registry (cold path; lock one shard at a time).
+    for (std::size_t i = 0; i < workerCount_; ++i) {
+        const Shard& s = *shards_[i];
+        std::lock_guard<std::mutex> lock(s.mux);
+        for (const auto& kv : s.participants) {
+            if (matches(kv.second)) {
                 return true;
             }
         }
-        for (const Participant& p : kv.second.subscribers) {
-            if (matches(p)) {
-                return true;
+    }
+    // A peer that has announced a topic subscription/publish is `known` even
+    // before/cross- the heartbeat path populates the peer registry; gate
+    // against both so a genuine topic-peer dial is accepted but a random
+    // non-participant is rejected (ADR-0002 §6.2 anti-spoof).
+    for (std::size_t i = 0; i < workerCount_; ++i) {
+        const Shard& s = *shards_[i];
+        std::lock_guard<std::mutex> lock(s.mux);
+        for (const auto& kv : s.topics) {
+            for (const Participant& p : kv.second.publishers) {
+                if (matches(p)) {
+                    return true;
+                }
+            }
+            for (const Participant& p : kv.second.subscribers) {
+                if (matches(p)) {
+                    return true;
+                }
             }
         }
     }
@@ -1022,15 +1242,22 @@ bool Edriel::publishReliable(const std::string& topicName,
     std::set<Participant> subscribers;
     std::uint64_t nextSeq = 0;
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        const auto it = topicRegistry.find(key);
-        if (it == topicRegistry.end() || it->second.subscribers.empty()) {
+        // Reliable subscribers for the topic live in the topic's shard
+        // (ADR-003 decision #2: the sharded registry is shared with reliable).
+        Shard& shard = shardRef(shardIndexForTopic(key));
+        std::lock_guard<std::mutex> lock(shard.mux);
+        const auto it = shard.topics.find(key);
+        if (it == shard.topics.end() || it->second.subscribers.empty()) {
             return false;  // no subscribers for this reliable topic
         }
         subscribers = it->second.subscribers;
-        // Tentative next tid. Commit only if the frame passes the MTU guard
-        // below, so a locally-rejected (never placed on the wire) frame cannot
-        // consume a sequence number and permanently gap a subscriber's window.
+    }
+    {
+        // Tentative next tid (reliable path bookkeeping, off the multicast hot
+        // path). Commit only if the frame passes the MTU guard below, so a
+        // locally-rejected (never placed on the wire) frame cannot consume a
+        // sequence number and permanently gap a subscriber's window.
+        std::lock_guard<std::mutex> lock(reliableMutex_);
         nextSeq = reliablePublisherSeq_[key] + 1;
     }
 
@@ -1063,7 +1290,7 @@ bool Edriel::publishReliable(const std::string& topicName,
     // Commit the sequence number now that the frame is guaranteed to be sent
     // (sends are serialized by grpcServiceMutex_, so no two threads race here).
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::lock_guard<std::mutex> lock(reliableMutex_);
         reliablePublisherSeq_[key] = nextSeq;
     }
 
@@ -1100,7 +1327,7 @@ void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {
     // dispatch after releasing it so user callbacks may re-enter the API.
     std::vector<autoDiscovery::DataMessage> toDispatch;
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::lock_guard<std::mutex> lock(reliableMutex_);
         // A fresh publisher stream was just established; its first frame must
         // baseline every window (the transport's prior in-flight frames are
         // gone, so an unreachable gap would otherwise stall the window). Consume
@@ -1208,7 +1435,7 @@ void Edriel::noteReliableStreamEstablished(std::uint64_t publisherUid) {
     // node keeps for that publisher to an "unbaselined" state so the first
     // frame on the new stream re-baselines it, instead of leaving the window
     // permanently stalled on an unreachable gap.
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::lock_guard<std::mutex> lock(reliableMutex_);
     // Mark the publisher fresh so a window that only comes into existence on a
     // later frame (late/never-yet-data subscriber) still starts unbaselined.
     reliableFreshPublishers_.insert(publisherUid);
@@ -1256,36 +1483,45 @@ void Edriel::reconcileReliableConnections() {
     };
     std::vector<Target> needed;
     bool subscribedReliable = false;
+    std::vector<std::string> subscribedTopics;
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::lock_guard<std::mutex> lock(reliableMutex_);
         subscribedReliable = !reliableSubscribedTopics_.empty();
-        // Canonical endpoints live in the global `participants` set (ADR-0002:
-        // refreshed on every heartbeat). The topicRegistry stores bare snapshots
-        // without endpoints, so cross-reference by (pid,tid,uid) for the reachable
-        // candidates of each publisher we must dial.
-        const auto canonicalEndpoints =
-            [this](const Participant& snap) -> const std::vector<autoDiscovery::Endpoint>* {
-            for (const Participant& p : participants) {
-                if (p.pid == snap.pid && p.tid == snap.tid && p.uid == snap.uid) {
-                    return &p.endpoints;
-                }
-            }
-            return nullptr;
-        };
-        for (const std::string& topicKey : reliableSubscribedTopics_) {
-            const auto it = topicRegistry.find(topicKey);
-            if (it == topicRegistry.end()) {
+        subscribedTopics.assign(reliableSubscribedTopics_.begin(),
+                                reliableSubscribedTopics_.end());
+    }
+    // Build the dial set from the SHARED sharded registry (ADR-003 decision #2):
+    // canonical endpoints live in the peer registry (shard hash(uid)%N), and
+    // the reliable topic's publishers live in the topic's shard (hash(topic)%N).
+    // Each shard is locked independently and briefly — no nested shard locks.
+    for (const std::string& topicKey : subscribedTopics) {
+        std::vector<Participant> pubs;
+        {
+            Shard& topShard = shardRef(shardIndexForTopic(topicKey));
+            std::lock_guard<std::mutex> lock(topShard.mux);
+            const auto it = topShard.topics.find(topicKey);
+            if (it == topShard.topics.end()) {
                 continue;
             }
-            for (const Participant& pub : it->second.publishers) {
-                const std::vector<autoDiscovery::Endpoint>* eps = canonicalEndpoints(pub);
-                if (eps == nullptr || eps->empty()) {
-                    continue;
+            pubs.assign(it->second.publishers.begin(),
+                        it->second.publishers.end());
+        }
+        for (const Participant& pub : pubs) {
+            std::vector<autoDiscovery::Endpoint> eps;
+            {
+                Shard& uidShard = shardRef(shardIndexForUid(pub.uid));
+                std::lock_guard<std::mutex> lock(uidShard.mux);
+                const auto it = uidShard.participants.find(pub.uid);
+                if (it != uidShard.participants.end()) {
+                    eps = it->second.endpoints;
                 }
-                needed.push_back(Target{
-                    {static_cast<std::uint32_t>(pub.pid), pub.tid, pub.uid},
-                    endpointCandidates(*eps)});
             }
+            if (eps.empty()) {
+                continue;
+            }
+            needed.push_back(Target{
+                {static_cast<std::uint32_t>(pub.pid), pub.tid, pub.uid},
+                endpointCandidates(eps)});
         }
     }
 

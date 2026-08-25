@@ -54,7 +54,7 @@ TEST(TestPubSub, RegisterSubscriberStoresCallback) {
     EXPECT_TRUE(edriel.registerSubscriberTopic<autoDiscovery::Topic>(
         "sensor", [&calls](const autoDiscovery::Topic&) { ++calls; }));
 
-    const auto& entry = edriel.registryForTest().at(
+    const auto entry = edriel.registryForTest().at(
         edriel::makeCompositeKey("sensor", "autoDiscovery.Topic"));
     EXPECT_EQ(entry.callbacks.size(), 1u);
 }

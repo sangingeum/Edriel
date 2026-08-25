@@ -67,3 +67,34 @@ advertise_address:
 #   - must be a positive integer; values above 64 clamp to 64
 #   - non-numeric, 0, or empty -> falls back to 4
 max_advertised_endpoints: 4
+
+# ----------------------------------------------------------------------------
+# ADR-003 sharded SPSC receive pipeline (best-effort multicast receive path).
+# ----------------------------------------------------------------------------
+
+# Socket-draining threads. ADR-003 keeps v1 at 1 (loopback has one kernel RX
+# queue; the true parallel lever is worker_threads below). Accepted/validated
+# up to 4 but not run >1 yet.
+#   - must be an integer in [1, 4]; invalid/out-of-range -> 1
+receiver_threads: 1
+
+# Shard / SPSC-ring / registry-shard worker count `N` — the true parallelism
+# lever for message RECEPTION. Each worker owns exactly one ring + registry
+# shard (no global lock on the hot path). worker_threads=1 reproduces the
+# exact single-threaded ordering behavior of the pre-ADR-003 build.
+#   - must be an integer in [1, 16]
+#   - invalid/out-of-range -> 4
+worker_threads: 4
+
+# Slots per worker's bounded userland SPSC ring — the drop buffer that makes
+# kernel overruns observable (overflow drops the OLDEST frame, counted, never
+# silent).
+#   - must be a power of two (mask-based routing)
+#   - invalid / non-power-of-two -> 4096
+rx_ring_slots: 4096
+
+# SO_RCVBUF on the UDP multicast receive socket, in bytes. 0 = leave the OS
+# default (recommended until a value is tuned on the target NIC/host).
+#   - must be an integer in [0, 1<<30]
+#   - invalid/out-of-range -> 0
+so_rcvbuf_bytes: 1048576

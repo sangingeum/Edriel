@@ -20,12 +20,15 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <unordered_map>
 #include <functional>
 #include <atomic>
 #include <mutex>   // registry synchronization
+#include <thread>
 #include <tuple>   // std::tie in Participant::operator<
 #include "EdrielConfig.hpp"
 #include "EdrielGrpcService.hpp"
+#include "EdrielRing.hpp"
 
 // ============================================================================
 // Topic Info Structure
@@ -289,14 +292,12 @@ private:
     std::atomic_bool isRunning{ false };           ///< Main loop running flag
     
     // ========================================================================
-    // Participant Registry
+    // Sharded Registry + Receive Pipeline (ADR-003)
     // ========================================================================
-    std::set<Participant> participants;             ///< All discovered participants
-    Participant selfParticipant{0, 0, 0};           ///< Placeholder for self
-    
-    // ========================================================================
-    // Topic Registry
-    // ========================================================================
+    /// This node's own identity (never part of the sharded peer registry; used
+    /// for the loopback self-filter and for reliable send identity).
+    Participant selfParticipant{0, 0, 0};
+
     /**
      * @struct TopicEntry
      * @brief Per-topic registry entry: local subscriber callbacks plus
@@ -319,24 +320,72 @@ private:
         std::vector<Callback> callbacks;
     };
 
-    /// Registry keyed by composite key (topicName + messageType)
-    std::map<std::string, TopicEntry> topicRegistry;
+    /**
+     * @brief One shard of the participant + topic registry, guarded by its own
+     *        mutex, plus the worker's SPSC ring and worker thread.
+     *
+     * ADR-003: NO global stateMutex on the receive hot path. The multicast
+     * receive thread fans frames out to per-shard rings; each worker owns one
+     * ring and one registry shard and runs them strictly single-threaded.
+     * Topic entries live in shard `hash(topicKey) % N`; peer participants live
+     * in shard `hash(uid) % N`. Reliable-path reads across shards (cold path
+     * only) merge by locking one shard at a time in ascending index order.
+     */
+    struct Shard {
+        /// Guards the registry halves below. `mutable` so const accessors
+        /// (registry reads / snapshots) can synchronize too.
+        mutable std::mutex mux;
+        std::unique_ptr<SpscRing<autoDiscovery::Message>> ring;
+        std::thread worker;
+        /// O(1) peer registry keyed on `uid` ALONE (ADR-003 decision #1) —
+        /// the process-unique random identity, not a packed composite key.
+        std::unordered_map<std::uint64_t, Participant> participants;
+        /// Local topic entries keyed by composite key (topicName + messageType).
+        std::map<std::string, TopicEntry> topics;
+    };
 
-    /// Guards the strand-shared mutables (`topicRegistry`, `participants`)
-    /// against concurrent access from the public API (any calling thread) and
-    /// the strand-serialized receive/cleaner loop. The public API must keep
-    /// synchronous mutation semantics, so the registry/participant documents
-    /// are protected here; the ASIO socket operations are separately confined
-    /// to the strand (see sendPacket).
-    mutable std::mutex stateMutex;
+    /// The `N` worker shards (size == workerCount()). Indexing is the ring and
+    /// registry routing convention used by every hot-path function.
+    std::vector<std::unique_ptr<Shard>> shards_;
+    /// Clamped `worker_threads` config in [1, 16] — the ring/shard count `N`.
+    std::size_t workerCount_ = 0;
+
+    /// The dedicated socket-drain thread (ADR-003: receiver_threads=1 in v1).
+    /// Runs its own io_context (`receiverIo_`) with an ASYNC receive loop, so
+    /// teardown is deterministic: closing the socket cancels the pending
+    /// receive, run() returns, and join() completes (a blocking sync receive
+    /// could hang the join if the socket close didn't wake it).
+    std::thread receiverThread_;
+    asio::io_context receiverIo_;
+    /// Reused receive buffer; only touched by the receiver thread and never
+    /// re-armed until the datagram is consumed into a ring.
+    Buffer receiverBuffer_{};
+    /// True once the receiver+worker threads are running (started by
+    /// startAutoDiscovery); guards idempotent start/stop.
+    bool pipelineStarted_ = false;
+
+    // ========================================================================
+    // Reliable-path shared state (ADR-0002). These are global, off the
+    // multicast hot path, and guarded by their own mutex (not a per-shard one):
+    // the reliable path is NOT routed through the SPSC worker topology.
+    // ========================================================================
+    /// Guards the reliable-path members below (`reliableWindows_`,
+    /// `reliableFreshPublishers_`, `reliableSubscribedTopics_`,
+    /// `reliablePublisherSeq_`). Replaces the old flat `stateMutex`; the
+    /// sharded multicast path never takes it.
+    mutable std::mutex reliableMutex_;
 
     // ---- Test hooks (unit-test access to internals) ------------------------
   public:
-    const std::map<std::string, TopicEntry>& registryForTest() const {
-        return topicRegistry;
+    /// Merged topic registry across all shards (test snapshot). Records must
+    /// match the pre-ADR-003 flat-map shape so existing tests keep passing.
+    std::map<std::string, TopicEntry> registryForTest() const {
+        return mergeRegistrySnapshot();
     }
-    const std::set<Participant>& participantsForTest() const {
-        return participants;
+    /// Merged participant registry across all shards (test snapshot), again as
+    /// the pre-ADR-3 flat `std::set<Participant>` for compatibility.
+    std::set<Participant> participantsForTest() const {
+        return mergeParticipantSnapshot();
     }
     /// This node's self-identity (test hook for wiring consistent registry
     /// snapshots without multicast).
@@ -354,23 +403,29 @@ private:
     /// Number of live per-(publisher,topic) reliable receiver windows (test
     /// hook for ISSUE #4's bounded-growth assertion).
     std::size_t reliableWindowsSizeForTest() const {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::lock_guard<std::mutex> lock(reliableMutex_);
         return reliableWindows_.size();
     }
     /// Age a known participant's last-seen so the next timeout cleanup removes
     /// it (and its reliable receive windows). Test hook for the ISSUE #4 prune.
     void ageParticipantForTest(std::uint64_t uid) {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        for (auto& p : participants) {
-            if (p.uid == uid) {
-                p.lastSeen -= std::chrono::hours(24);
-            }
-        }
+        ageParticipant(uid);
     }
     /// Run the participant-timeout cleanup (removes stale participants and
     /// prunes their reliable windows). Test hook for the ISSUE #4 prune.
     void runTimeoutCleanupForTest() {
         removeTimedOutParticipants();
+    }
+    /// Total frames dropped by ring overflow (LMO drop-oldest) across all
+    /// shards — the observable, never-silent loss metric (ADR-003 decision #4).
+    std::uint64_t droppedFrames() const {
+        std::uint64_t total = 0;
+        for (const auto& shard : shards_) {
+            if (shard->ring) {
+                total += shard->ring->dropped();
+            }
+        }
+        return total;
     }
 
   private:
@@ -379,27 +434,66 @@ private:
     // ========================================================================
     
     /**
-     * @brief Handles received auto-discovery packets
-     * @param buffer Shared pointer to receive buffer
-     * @param ec ASIO error code
-     * @param bytesTransferred Number of bytes received
-     */
-    void handleAutoDiscoveryReceive(std::shared_ptr<Buffer> buffer,
-                                     const asio::error_code& ec,
-                                     std::size_t bytesTransferred);
-
-    /**
-     * @brief Dispatches a parsed discovery message by content type (oneof)
+     * @brief Dispatches a parsed discovery message by content type (oneof) to
+     *        the owning shard. Called by each worker for ring-popped frames and
+     *        by the public test hook.
      * @param receivedMessage Parsed protobuf message
      */
     void handleAutoDiscoveryParse(const autoDiscovery::Message& receivedMessage);
     
     /**
-     * @brief Starts the auto-discovery receiver loop
-     * @param buffer Optional buffer (uses default if not provided)
+     * @brief Starts the ADR-003 sharded receive pipeline: the socket-drain
+     *        thread and the `worker_threads` worker threads (rings + shards).
      */
-    void startAutoDiscoveryReceiver(std::shared_ptr<Buffer> buffer = std::make_shared<Buffer>());
-    
+    void startReceivePipeline();
+
+    /**
+     * @brief Stops the pipeline: unblocks and joins the receiver and every
+     *        worker thread. Idempotent.
+     */
+    void stopReceivePipeline();
+
+    /**
+     * @brief The socket-drain thread body (ADR-003, receiver_threads=1 in v1).
+     *        Runs `receiverIo_`, which is fed by an async_receive loop that
+     *        copies datagrams into rings and re-arms immediately — the socket
+     *        never waits on parse/dispatch, so the kernel buffer cannot overrun.
+     */
+    void autoDiscoveryReceiverLoop();
+
+    /// Issue (or re-issue) the async_receive on the receiver io_context.
+    void armAutoDiscoveryReceive();
+
+    /// Copy a received datagram (already in `receiverBuffer_`) into the owning
+    /// shard's ring. Fast, no payload decode — routing only.
+    void handleReceivedDatagram(std::size_t bytesTransferred);
+
+    /**
+     * @brief One shard's worker thread body. Pops `autoDiscovery::Message`s
+     *        off its own SPSC ring and dispatches them (parse/dispatch). Strict
+     *        single-consumer per ring -> per-topic sequential ordering for free.
+     * @param shardIndex This worker's shard index, in [0, workerCount()).
+     */
+    void autoDiscoveryWorkerLoop(std::size_t shardIndex);
+
+    // --- ADR-003 shard routing + snapshot helpers ---------------------------
+    /// Shard index for a composite topic key: hash(composite) % N. One topic
+    /// lives on exactly one worker (ADR-003 decision #2).
+    std::size_t shardIndexForTopic(const std::string& compositeKey) const;
+    /// Shard index for a peer `uid`: hash(uid) % N (ADR-003 decision #1).
+    std::size_t shardIndexForUid(std::uint64_t uid) const;
+    /// Non-owning access to a shard (the receiver/worker routing convention).
+    Shard& shardRef(std::size_t index);
+    const Shard& shardRef(std::size_t index) const;
+    /// Merged topic registry across every shard (cold-path/test snapshot).
+    std::map<std::string, TopicEntry> mergeRegistrySnapshot() const;
+    /// Merged participant registry across every shard (cold-path/test snapshot).
+    std::set<Participant> mergeParticipantSnapshot() const;
+    /// Age a participant's last-seen (test hook); no-op when not registered.
+    void ageParticipant(std::uint64_t uid);
+    /// Number of valid worker shards (clamped config worker_threads).
+    std::size_t workerCount() const;
+
     /**
      * @brief Starts periodic discovery message sender
      */
@@ -729,10 +823,11 @@ bool Edriel::registerPublisherTopic(const std::string& topicName, bool reliable)
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
 
     {
-        // Registry mutation is strand-shared state: guard it so a concurrent
-        // caller thread cannot race the receive/cleaner loop.
-        std::lock_guard<std::mutex> lock(stateMutex);
-        TopicEntry& entry = topicRegistry[topicInfo.key];
+        // Registry is sharded by topic key; guard just this topic's shard so
+        // a concurrent caller cannot race the worker that owns it.
+        Shard& shard = shardRef(shardIndexForTopic(topicInfo.key));
+        std::lock_guard<std::mutex> lock(shard.mux);
+        TopicEntry& entry = shard.topics[topicInfo.key];
         entry.topicName = topicName;
         entry.messageType = topicInfo.messageType;
         entry.reliable = reliable;
@@ -765,12 +860,13 @@ bool Edriel::registerPublisherTopic(const std::string& topicName, bool reliable)
 template<typename T> requires Topic<T>
 bool Edriel::unregisterPublisherTopic(const std::string& topicName) {
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
-
-    std::lock_guard<std::mutex> lock(stateMutex);
     const std::string key = topicInfo.key;
 
-    auto it = topicRegistry.find(key);
-    if (it == topicRegistry.end()) {
+    Shard& shard = shardRef(shardIndexForTopic(key));
+    std::lock_guard<std::mutex> lock(shard.mux);
+
+    auto it = shard.topics.find(key);
+    if (it == shard.topics.end()) {
         std::cout << "[Edriel] Unregister for unknown topic: " << topicName << "\n";
         return false;
     }
@@ -778,7 +874,7 @@ bool Edriel::unregisterPublisherTopic(const std::string& topicName) {
     // No local publisher-side state beyond the entry itself; drop the entry
     // if no local callbacks remain, otherwise keep it for the subscriber side.
     if (it->second.callbacks.empty()) {
-        topicRegistry.erase(it);
+        shard.topics.erase(it);
     }
 
     std::cout << "[Edriel] Unregistered publisher topic: " << topicName << "\n";
@@ -799,14 +895,19 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName, bool reliable
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
 
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        TopicEntry& entry = topicRegistry[topicInfo.key];
+        Shard& shard = shardRef(shardIndexForTopic(topicInfo.key));
+        std::lock_guard<std::mutex> lock(shard.mux);
+        TopicEntry& entry = shard.topics[topicInfo.key];
         entry.topicName = topicName;
         entry.messageType = topicInfo.messageType;
         entry.reliable = reliable;
-        if (reliable) {
-            reliableSubscribedTopics_.insert(topicInfo.key);
-        }
+    }
+
+    if (reliable) {
+        // Reliable subscription bookkeeping is global, off the hot path, and
+        // guarded by its own mutex (never held together with a shard lock).
+        std::lock_guard<std::mutex> lock(reliableMutex_);
+        reliableSubscribedTopics_.insert(topicInfo.key);
     }
 
     autoDiscovery::TopicAdvertisement ad;
@@ -846,14 +947,12 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName,
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
 
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        TopicEntry& entry = topicRegistry[topicInfo.key];
+        Shard& shard = shardRef(shardIndexForTopic(topicInfo.key));
+        std::lock_guard<std::mutex> lock(shard.mux);
+        TopicEntry& entry = shard.topics[topicInfo.key];
         entry.topicName = topicName;
         entry.messageType = topicInfo.messageType;
         entry.reliable = reliable;
-        if (reliable) {
-            reliableSubscribedTopics_.insert(topicInfo.key);
-        }
 
         TopicEntry::Callback erased;
         erased.messageType = topicInfo.messageType;
@@ -861,6 +960,11 @@ bool Edriel::registerSubscriberTopic(const std::string& topicName,
             fn(dynamic_cast<const T&>(msg));
         };
         entry.callbacks.push_back(std::move(erased));
+    }
+
+    if (reliable) {
+        std::lock_guard<std::mutex> lock(reliableMutex_);
+        reliableSubscribedTopics_.insert(topicInfo.key);
     }
 
     std::cout << "[Edriel] Registered subscriber topic with callback: "
@@ -888,10 +992,12 @@ bool Edriel::subscribe(const std::string& topicName,
     }
 
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
+    const std::string key = topicInfo.key;
 
-    std::lock_guard<std::mutex> lock(stateMutex);
-    auto it = topicRegistry.find(topicInfo.key);
-    if (it == topicRegistry.end()) {
+    Shard& shard = shardRef(shardIndexForTopic(key));
+    std::lock_guard<std::mutex> lock(shard.mux);
+    auto it = shard.topics.find(key);
+    if (it == shard.topics.end()) {
         std::cout << "[Edriel] Subscribe for unregistered topic: "
                   << topicName << "\n";
         return false;
@@ -918,23 +1024,29 @@ bool Edriel::subscribe(const std::string& topicName,
 template<typename T> requires Topic<T>
 bool Edriel::unregisterSubscriberTopic(const std::string& topicName) {
     TopicInfo topicInfo(topicName, std::string(T::descriptor()->full_name()));
-
-    std::lock_guard<std::mutex> lock(stateMutex);
     const std::string key = topicInfo.key;
 
-    auto it = topicRegistry.find(key);
-    if (it == topicRegistry.end()) {
-        std::cout << "[Edriel] Unregister for unknown topic: " << topicName << "\n";
-        return false;
+    {
+        Shard& shard = shardRef(shardIndexForTopic(key));
+        std::lock_guard<std::mutex> lock(shard.mux);
+
+        auto it = shard.topics.find(key);
+        if (it == shard.topics.end()) {
+            std::cout << "[Edriel] Unregister for unknown topic: "
+                      << topicName << "\n";
+            return false;
+        }
+
+        // Remove all local callbacks for this topic; keep the entry only if it
+        // still tracks remote peers (registry bookkeeping for discovery).
+        it->second.callbacks.clear();
+        if (it->second.publishers.empty() && it->second.subscribers.empty()) {
+            shard.topics.erase(it);
+        }
     }
 
-    // Remove all local callbacks for this topic; keep the entry only if it
-    // still tracks remote peers (registry bookkeeping for discovery).
-    it->second.callbacks.clear();
+    std::lock_guard<std::mutex> lock(reliableMutex_);
     reliableSubscribedTopics_.erase(key);
-    if (it->second.publishers.empty() && it->second.subscribers.empty()) {
-        topicRegistry.erase(it);
-    }
 
     std::cout << "[Edriel] Unregistered subscriber topic: " << topicName << "\n";
     return true;
@@ -971,9 +1083,11 @@ bool Edriel::sendMessage(const std::string& topicName, const T& message) {
     // once), best-effort topics stay on multicast exactly as before.
     bool reliable = false;
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        const auto it = topicRegistry.find(makeCompositeKey(topicName, messageType));
-        if (it != topicRegistry.end() && it->second.reliable) {
+        const std::string key = makeCompositeKey(topicName, messageType);
+        Shard& shard = shardRef(shardIndexForTopic(key));
+        std::lock_guard<std::mutex> lock(shard.mux);
+        const auto it = shard.topics.find(key);
+        if (it != shard.topics.end() && it->second.reliable) {
             reliable = true;
         }
     }

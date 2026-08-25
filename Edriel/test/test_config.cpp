@@ -395,3 +395,109 @@ TEST(LoadConfig, InvalidPeerEntryIsSkipped) {
     EXPECT_EQ(cfg.peerEndpoints[0], "10.0.0.3:4400");
     EXPECT_TRUE(cfg.fellBackToDefaults);
 }
+
+// --- ADR-003 sharded SPSC receive-pipeline keys -----------------------------
+
+constexpr uint32_t kDefaultWorker = edriel::kDefaultWorkerThreads;       // 4
+constexpr uint32_t kDefaultReceiver = edriel::kDefaultReceiverThreads;   // 1
+const std::size_t kDefaultRingSlots = edriel::kDefaultRxRingSlots;        // 4096
+
+TEST(ParseCountRange, AcceptsInRange) {
+    // worker_threads [1,16]
+    EXPECT_EQ(edriel::parseCountRange(
+                  "4", edriel::kMinWorkerThreads,
+                  edriel::kMaxWorkerThreads, edriel::kDefaultWorkerThreads), 4u);
+    EXPECT_EQ(edriel::parseCountRange(
+                  "16", edriel::kMinWorkerThreads,
+                  edriel::kMaxWorkerThreads, edriel::kDefaultWorkerThreads), 16u);
+    // receiver_threads [1,4]
+    EXPECT_EQ(edriel::parseCountRange(
+                  "1", edriel::kMinReceiverThreads,
+                  edriel::kMaxReceiverThreads, kDefaultReceiver), 1u);
+}
+
+TEST(ParseCountRange, FallsBackOnOutOfRange) {
+    EXPECT_EQ(edriel::parseCountRange(
+                  "0", edriel::kMinWorkerThreads,
+                  edriel::kMaxWorkerThreads, edriel::kDefaultWorkerThreads), edriel::kDefaultWorkerThreads);
+    EXPECT_EQ(edriel::parseCountRange(
+                  "17", edriel::kMinWorkerThreads,
+                  edriel::kMaxWorkerThreads, edriel::kDefaultWorkerThreads), edriel::kDefaultWorkerThreads);
+    EXPECT_EQ(edriel::parseCountRange(
+                  "5", edriel::kMinReceiverThreads,
+                  edriel::kMaxReceiverThreads, kDefaultReceiver), kDefaultReceiver);
+}
+
+TEST(ParseCountRange, FallsBackOnJunk) {
+    EXPECT_EQ(edriel::parseCountRange(
+                  "abc", 1u, 16u, edriel::kDefaultWorkerThreads), edriel::kDefaultWorkerThreads);
+    EXPECT_EQ(edriel::parseCountRange(
+                  "", 1u, 16u, edriel::kDefaultWorkerThreads), edriel::kDefaultWorkerThreads);
+    EXPECT_EQ(edriel::parseCountRange(
+                  "-1", 1u, 16u, edriel::kDefaultWorkerThreads), edriel::kDefaultWorkerThreads);
+    EXPECT_EQ(edriel::parseCountRange(
+                  " 4", 1u, 16u, edriel::kDefaultWorkerThreads), edriel::kDefaultWorkerThreads);
+    EXPECT_EQ(edriel::parseCountRange(
+                  "4 ", 1u, 16u, edriel::kDefaultWorkerThreads), edriel::kDefaultWorkerThreads);
+}
+
+TEST(ParseRingSlots, AcceptsPowerOfTwo) {
+    EXPECT_EQ(edriel::parseRingSlots("2"), 2u);
+    EXPECT_EQ(edriel::parseRingSlots("4096"), 4096u);
+    EXPECT_EQ(edriel::parseRingSlots("1024"), 1024u);
+}
+
+TEST(ParseRingSlots, RejectsNonPowerOfTwo) {
+    EXPECT_EQ(edriel::parseRingSlots("3"), kDefaultRingSlots);
+    EXPECT_EQ(edriel::parseRingSlots("0"), kDefaultRingSlots);
+    EXPECT_EQ(edriel::parseRingSlots("1"), kDefaultRingSlots);
+    EXPECT_EQ(edriel::parseRingSlots("100"), kDefaultRingSlots);
+    EXPECT_EQ(edriel::parseRingSlots("4095"), kDefaultRingSlots);
+    EXPECT_EQ(edriel::parseRingSlots("abc"), kDefaultRingSlots);
+    EXPECT_EQ(edriel::parseRingSlots("4096 "), kDefaultRingSlots);
+}
+
+TEST(LoadConfig, ParsesAdr003Keys) {
+    const auto path = writeTempConfig(
+        "port: 31000\n"
+        "multicast_ip: 224.0.0.11\n"
+        "discovery_period_seconds: 3\n"
+        "participant_timeout_seconds: 12\n"
+        "grpc_port: 4500\n"
+        "max_advertised_endpoints: 6\n"
+        "receiver_threads: 2\n"
+        "worker_threads: 8\n"
+        "rx_ring_slots: 1024\n"
+        "so_rcvbuf_bytes: 1048576\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.receiverThreads, 2u);
+    EXPECT_EQ(cfg.workerThreads, 8u);
+    EXPECT_EQ(cfg.rxRingSlots, 1024u);
+    EXPECT_EQ(cfg.soRcvbufBytes, 1048576u);
+    // Upstream keys present -> no spurious fallback diagnostic fires.
+    EXPECT_FALSE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, Adr003KeysFallBackOnInvalid) {
+    // worker_threads out of range + rx_ring_slots not a power of two.
+    const auto path = writeTempConfig(
+        "worker_threads: 99\n"
+        "rx_ring_slots: 100\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.workerThreads, kDefaultWorker);                 // invalid -> fallback
+    EXPECT_EQ(cfg.receiverThreads, kDefaultReceiver);      // absent -> default
+    EXPECT_EQ(cfg.rxRingSlots, kDefaultRingSlots);         // fallback
+    EXPECT_TRUE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, MissingAdr003KeysKeepDefaults) {
+    const auto path = writeTempConfig("port: 30002\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.workerThreads, kDefaultWorker);
+    EXPECT_EQ(cfg.receiverThreads, kDefaultReceiver);
+    EXPECT_EQ(cfg.rxRingSlots, kDefaultRingSlots);
+    EXPECT_EQ(cfg.soRcvbufBytes, 0u);
+}
