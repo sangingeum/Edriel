@@ -41,38 +41,10 @@ endif()
 # 4. EdrielProtoMessages: helper for users adding their own .proto messages
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
-# 5. Proto file list (excluding test/benchmark protos handled below)
+# 5. Proto file list
 set(PROTO_DIR "${CMAKE_SOURCE_DIR}/Proto")
 set(OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 file(GLOB PROTO_FILES "${PROTO_DIR}/*.proto")
-file(GLOB TEST_PROTO_FILES "${PROTO_DIR}/*test*.proto" "${PROTO_DIR}/*bench*.proto")
-if(TEST_PROTO_FILES)
-    list(REMOVE_ITEM PROTO_FILES ${TEST_PROTO_FILES})
-endif()
-
-# Test/benchmark messages: compiled the same way but linked only where needed.
-set(TEST_PROTO_SRCS)
-set(TEST_PROTO_HDRS)
-foreach(PROTO_FILE ${TEST_PROTO_FILES})
-    get_filename_component(FIL_WE ${PROTO_FILE} NAME_WE)
-    list(APPEND TEST_PROTO_SRCS "${OUT_DIR}/${FIL_WE}.pb.cc")
-    list(APPEND TEST_PROTO_HDRS "${OUT_DIR}/${FIL_WE}.pb.h")
-    add_custom_command(
-        OUTPUT "${OUT_DIR}/${FIL_WE}.pb.cc" "${OUT_DIR}/${FIL_WE}.pb.h"
-        COMMAND "${EDRIEL_PROTOC_EXEC}"
-        ARGS --proto_path=${PROTO_DIR}
-             --cpp_out=${OUT_DIR}
-             ${PROTO_FILE}
-        DEPENDS ${PROTO_FILE}
-        COMMENT "Compiling ${FIL_WE}.proto (test/bench) to C++..."
-        VERBATIM
-    )
-endforeach()
-
-add_library(EdrielTestMessages STATIC ${TEST_PROTO_SRCS} ${TEST_PROTO_HDRS})
-target_link_libraries(EdrielTestMessages PUBLIC protobuf::libprotobuf)
-target_include_directories(EdrielTestMessages PUBLIC "${OUT_DIR}")
-target_compile_options(EdrielTestMessages PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 # 생성될 파일들의 목록을 담을 변수 초기화
 set(PROTO_SRCS)
@@ -157,3 +129,6 @@ add_subdirectory(test)
 
 # 10. 예제 (사용자 정의 .proto 메시지 사용 예)
 add_subdirectory("${CMAKE_SOURCE_DIR}/examples" "${CMAKE_BINARY_DIR}/examples")
+
+# 11. 벤치마크 (단위 테스트 트리와 분리된 독립 target; CTest에 등록되지 않음)
+add_subdirectory("${CMAKE_SOURCE_DIR}/benchmark" "${CMAKE_BINARY_DIR}/benchmark")

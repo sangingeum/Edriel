@@ -40,7 +40,7 @@ ctest --test-dir build/Release/Edriel/test --output-on-failure
 Run benchmarks (latency + throughput over multicast loopback):
 
 ```bash
-./build/Release/Edriel/test/benchmark
+./build/Release/benchmark/benchmark
 ```
 
 ## Configuration (`config.yml`)
@@ -141,7 +141,7 @@ hash.
 
 ## Benchmark baseline
 
-Measured with `Edriel/test/benchmark.cpp` on Ubuntu 24.04, g++ 13.3, Release
+Measured with `benchmark/benchmark.cpp` on Ubuntu 24.04, g++ 13.3, Release
 (`-O2`), over multicast loopback (239.255.0.1:30002), 2026-08, at HEAD
 `370b5cb` with `worker_threads=4`. The single-node latency number is the
 publish → callback round trip (500 paced samples); the receive figures come
@@ -157,7 +157,7 @@ from the decoupled two-node harness:
 
 ### True unpushed receive max (N=4, ADR-003)
 
-Measured with `Benchmark.TwoNodeReceiveThroughput` in `Edriel/test/benchmark.cpp`
+Measured with `Benchmark.TwoNodeReceiveThroughput` in `benchmark/benchmark.cpp`
 (worker_threads=4, 4 shard-distinct topics over multicast loopback, 256 B
 payload). This harness *floods* the consumer unpaced — four producers send as
 fast as their strands and the loopback wire will carry (~2.2–2.5M frames/s
@@ -180,7 +180,7 @@ is what a fresh run of the benchmark prints as `CONSUMER TRUE MAX`, so this
 README value reproduces directly. Reproduce with:
 
 ```bash
-./build/Release/Edriel/test/benchmark --gtest_filter=Benchmark.TwoNodeReceiveThroughput
+./build/Release/benchmark/benchmark --gtest_filter=Benchmark.TwoNodeReceiveThroughput
 ```
 
 ## Core concepts

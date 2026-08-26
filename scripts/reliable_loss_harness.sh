@@ -51,7 +51,7 @@ done
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_BIN="$REPO/$BUILD_DIR/Edriel/test/test_reliable"
-BENCH_BIN="$REPO/$BUILD_DIR/Edriel/test/benchmark"
+BENCH_BIN="$REPO/$BUILD_DIR/benchmark/benchmark"
 
 [[ -x "$TEST_BIN" ]] || { echo "missing $TEST_BIN — build first (cmake --build $BUILD_DIR)" >&2; exit 2; }
 

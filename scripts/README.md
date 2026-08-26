@@ -32,7 +32,7 @@ A crash or any failed run fails the harness gate.
   netem path. On a host without these the harness can still run a **no-loss
   control** with `--no-netem`.
 - A configured build tree (default `cmbuild_final`) containing
-  `Edriel/test/test_reliable` and `Edriel/test/benchmark`.
+  `Edriel/test/test_reliable` and `benchmark/benchmark`.
 
 ## Usage
 

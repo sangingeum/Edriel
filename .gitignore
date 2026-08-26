@@ -54,6 +54,9 @@ build_pf
 build_pf_gen
 cmbuild_*
 
+# worker write-backstop lock (CONVENTIONS.md Rule #3: transient, never committed)
+.worker.lock
+
 # VS
 .vs
 # CMake / Conan user-local files (ignored: per-machine, not part of the repo)

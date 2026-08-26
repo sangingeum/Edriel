@@ -1,6 +1,6 @@
 include("${CMAKE_SOURCE_DIR}/cmake/EdrielProtoMessages.cmake")
 
-# Payload types used by test_pubsub and the benchmarks.
+# Payload type used by test_pubsub.
 edriel_add_proto_messages(test_messages
     SRCS test_messages.proto
     PROTO_PATH ${CMAKE_CURRENT_SOURCE_DIR}
@@ -138,25 +138,3 @@ target_link_libraries(test_reliable PRIVATE
 )
 
 add_test(NAME TestReliable COMMAND test_reliable)
-
-# benchmark: Performance benchmarks (latency, single-node throughput, and the
-# two-node receive-only ceiling). Registered under CTest so the ADR-003
-# receive-ceiling "before" number is part of the test suite.
-add_executable(benchmark
-    benchmark.cpp
-)
-
-target_compile_options(benchmark PRIVATE ${EDRIEL_STRICT_FLAGS})
-
-target_link_libraries(benchmark PRIVATE
-    EdrielLib
-    EdrielTestMessages
-    GTest::gtest_main
-)
-
-# benchmark.cpp includes protobuf headers generated into Edriel's binary dir.
-target_include_directories(benchmark PRIVATE
-    "${CMAKE_BINARY_DIR}"
-)
-
-add_test(NAME Benchmarks COMMAND benchmark)
