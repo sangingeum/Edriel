@@ -1,0 +1,80 @@
+# Edriel CI — first pipeline
+#
+# Builds the library and runs the unit/integration test suite on a fresh
+# standard GitHub-hosted runner. Public repo => GitHub-hosted runner minutes
+# are free.
+#
+# The performance benchmark (benchmark/) is INTENTIONALLY excluded from CI:
+# it measures multicast-loopback latency/throughput and an execution on a
+# headless shared runner is not a reproducible perf gate. Run it manually:
+#   ./<build>/benchmark/benchmark   (from the repo root so config.yml applies)
+#
+# Conventions note: we configure with an explicit CMAKE_TOOLCHAIN_FILE rather
+# than `cmake --preset conan-release`, because the conan-generated presets are
+# wired through the machine-local CMakeUserPresets.json (rewritten on every
+# `conan install`) and are not reliable on a fresh checkout.
+
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: build + tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    env:
+      # Conan build/output folder. Conan's cmake_layout nests the generator
+      # output under <of>/build/Release; keep paths below consistent with that.
+      BUILD_DIR: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Conan data
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          # Key on the dependency spec (conanfile.txt) so dep-only changes
+          # invalidate; restore-keys keep conan data across misses.
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            conan-${{ runner.os }}-
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_DIR }}
+          key: build-${{ runner.os }}-${{ hashFiles('conanfile.txt', 'CMakeLists.txt', 'Edriel/CMakeLists.txt', 'Edriel/test/CMakeLists.txt', 'benchmark/CMakeLists.txt', 'examples/CMakeLists.txt') }}
+          restore-keys: |
+            build-${{ runner.os }}-
+
+      - name: Install Conan
+        run: |
+          python3 -m pip install --user --quiet conan==2.31.2
+          # Add --user install dir to PATH for this job's steps.
+          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+        shell: bash
+
+      - name: Conan profile detect
+        run: conan profile detect --force
+
+      - name: Conan install (deps + toolchain)
+        run: conan install . -of=${{ env.BUILD_DIR }} --build=missing
+
+      - name: Configure (explicit toolchain, no presets)
+        run: >
+          cmake -S . -B ${{ env.BUILD_DIR }}/build/Release
+          -DCMAKE_TOOLCHAIN_FILE=${{ env.BUILD_DIR }}/build/Release/generators/conan_toolchain.cmake
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+
+      - name: Build
+        run: cmake --build ${{ env.BUILD_DIR }}/build/Release -j "$(nproc)"
+
+      - name: Run tests (9 unit/integration tests; benchmark excluded)
+        run: >
+          ctest --test-dir ${{ env.BUILD_DIR }}/build/Release/Edriel/test
+          --output-on-failure
