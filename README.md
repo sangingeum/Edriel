@@ -63,6 +63,12 @@ advertise_address:      # optional scalar or list; empty = discover-only
 max_advertised_endpoints: 4
 peers:                  # optional static endpoints for multicast-blind nodes
   # - 192.168.1.5:4000
+
+# ADR-003 sharded SPSC receive pipeline (best-effort multicast receive path)
+receiver_threads: 1     # socket-draining threads (keep 1; see table)
+worker_threads: 4       # shard/ring/registry-shard workers N (the real lever)
+rx_ring_slots: 4096     # slots per worker's bounded SPSC ring (power of two)
+so_rcvbuf_bytes: 1048576  # SO_RCVBUF on the multicast socket; 0 = OS default
 ```
 
 | Key | Valid range | Falls back to |
@@ -75,6 +81,10 @@ peers:                  # optional static endpoints for multicast-blind nodes
 | `advertise_address` | scalar or list of non-empty strings (IP/hostname); empty/absent = discover-only | *empty list* |
 | `peers` | scalar or list of `address:port` (or bare host → `grpc_port`) static seeds for multicast-blind subscribers | *empty list* |
 | `max_advertised_endpoints` | whole number, capped at `64` | `4` |
+| `receiver_threads` | integer in `1..4` (ADR-003 keeps 1; multi-queue NIC only) | `1` |
+| `worker_threads` | integer in `1..16` | `4` |
+| `rx_ring_slots` | power of two | `4096` |
+| `so_rcvbuf_bytes` | integer in `0..1<<30` (`0` = OS default) | `0` |
 
 The `grpc_port` / `advertise_address` / `max_advertised_endpoints` / `peers` keys
 drive the reliable path (ADR-0002). Every node runs one gRPC server on `grpc_port`
@@ -112,48 +122,60 @@ edriel::Edriel edrielCfg(io, config);   // explicit edriel::Config
 explicit-constructor overload lets a host application supply validated settings
 without a config file being present.
 
+### Receive path: ADR-003 sharded SPSC pipeline
+
+The best-effort multicast *receive* path is a sharded pipeline (ADR-0003). A
+single socket-drainer thread (`receiver_threads`, default `1`) copies raw
+datagrams off the UDP socket and fans them into `worker_threads` (= `N`)
+bounded single-producer/single-consumer rings; each worker owns exactly one
+ring plus a shard of the participant/topic registry guarded by its own mutex
+(no global lock on the hot path). Frames are pinned to a worker by hashing the
+topic name, so all frames for one topic run in order on one worker while
+different topics dispatch in parallel. Overflow drops the *oldest* ring slot
+and is counted (never silent), and kernel `SO_RXQ_OVFL` overruns are folded
+into the same observable counter — so end-to-end loss is always visible via
+`droppedFrames()`. `worker_threads=1` reproduces the exact pre-ADR-003
+single-threaded ordering for callers that need it. The reliable gRPC path
+(ADR-0002) is unchanged and shares the sharded registry by the same topic
+hash.
+
 ## Benchmark baseline
 
 Measured with `Edriel/test/benchmark.cpp` on Ubuntu 24.04, g++ 13.3, Release
-(`-O2`), single node publishing to itself over multicast loopback
-(239.255.0.1:30002), 2026-08:
+(`-O2`), over multicast loopback (239.255.0.1:30002), 2026-08, at HEAD
+`370b5cb` with `worker_threads=4`. The single-node latency number is the
+publish → callback round trip (500 paced samples); the receive figures come
+from the decoupled two-node harness:
 
 | Metric                          | Value                          |
 |---------------------------------|--------------------------------|
-| publish→callback latency p50    | ~20–28 µs                      |
-| publish→callback latency p99    | ~80–120 µs                     |
-| publish→callback latency max    | ~0.1–0.4 ms                    |
-| throughput, sent (256B payload) | ~100–115k msgs/s               |
-| throughput, received            | ~2–8k msgs/s (loopback, best-effort UDP) |
-
-Latency is measured per message (500 paced samples); throughput is a 2 s
-unpaced burst. Received throughput on loopback is limited by the single
-receive-completion path on the node's io_context thread — each datagram pays a
-protobuf envelope parse plus a payload decode. The receive path is allocation-
-and log-free per packet; the per-callback descriptor lookup was hoisted to once
-per message.
+| publish→callback latency p50    | ~27 µs                         |
+| publish→callback latency p99    | ~80 µs                         |
+| publish→callback latency max    | ~0.1 ms                        |
+| Consumer true max received (N=4)| ~527k msgs/s (fresh runs 509k / 527k / 540k) |
+| Hard gate (1.5 × ~118k baseline)| ≥ 177k msgs/s — passed in every run |
 
 ### True unpushed receive max (N=4, ADR-003)
 
 Measured with `Benchmark.TwoNodeReceiveThroughput` in `Edriel/test/benchmark.cpp`
 (worker_threads=4, 4 shard-distinct topics over multicast loopback, 256 B
 payload). This harness *floods* the consumer unpaced — four producers send as
-fast as their strands and the loopback wire will carry (~2.2–2.4M frames/s
+fast as their strands and the loopback wire will carry (~2.2–2.5M frames/s
 offered to the consumer socket), so the consumer is genuinely saturated on
 every run and the delivered figure is its TRUE unpushed ceiling, not a
 producer-paced target.
 
-| Metric (N=4, 2026-08)                | Value                                   |
+| Metric (N=4, 2026-08, fresh run @ 370b5cb) | Value                                   |
 |--------------------------------------|-----------------------------------------|
-| Consumer true max received           | ~490k msgs/s (best 1s delivered window; median over runs, typical 450–540k) |
-| Producer send max (offered)          | ~2.2–2.4M msgs/s (4 producers, flood to loopback) |
-| Loss at that operating point         | ~30–60% — a genuinely saturated consumer drops whatever exceeds its ceiling |
+| Consumer true max received           | ~527k msgs/s (best 1s delivered window; fresh runs 509k / 527k / 540k) |
+| Producer send max (offered)          | ~2.2–2.5M msgs/s (4 producers, flood to loopback) |
+| Loss at that operating point         | ~30–40% — a genuinely saturated consumer drops whatever exceeds its ceiling |
 | Hard gate (1.5 × ~118k baseline)     | ≥ 177k msgs/s — passed in every run     |
 
 The old keep-pace figure (~211k msgs/s) *paced* the producers at a cold wire
 target and reported the consumer keeping up; it under-stated the unpushed
-ceiling. The consumer's true unpushed max under a hard flood is ~490k msgs/s
-(best one-second window; the figure is the median of several runs). The number
+ceiling. The consumer's true unpushed max under a hard flood is ~490–540k
+msgs/s (best one-second window; median ~527k across fresh runs). The number
 is what a fresh run of the benchmark prints as `CONSUMER TRUE MAX`, so this
 README value reproduces directly. Reproduce with:
 

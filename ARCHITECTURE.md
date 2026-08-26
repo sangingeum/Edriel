@@ -193,6 +193,8 @@ the discovery send + cleanup timer cadences.
 ```
 
 ### Message Delivery Flow
+
+Send (user → wire):
 ```
 1. User calls sendMessage(topic, message)
 2. Serialize message
@@ -201,6 +203,18 @@ the discovery send + cleanup timer cadences.
 5. Create multicast packet
 6. Async_send_to multicast socket
 7. Return on completion
+```
+
+Receive (wire → callback, ADR-003 sharded SPSC pipeline):
+```
+1. Receiver thread drains raw datagrams off the UDP socket (SO_RXQ_OVFL counted)
+2. Route frame to worker = hash(topic) % N; push into that worker's SPSC ring
+   (ring full -> drop OLDEST slot, counted; never silent)
+3. Worker pops the frame, parses the protobuf envelope, updates the
+   participant registry (O(1) uid lookup) and topic registry shard
+4. Worker decodes the payload once and invokes matching local callbacks
+   for the topic
+5. All frames of one topic run in order on that topic's single worker
 ```
 
 ### gRPC Streaming Flow
@@ -219,11 +233,15 @@ Server:  Send final status on close
 |----------|-------|-------------|
 | `discoveryPort` (config.yml `port`) | 30002 | Multicast port — overridable, falls back on invalid |
 | `multicastAddress` (config.yml `multicast_ip`) | 239.255.0.1 | Multicast group address — overridable, falls back on invalid |
-| `recvBufferSize` | 1500 | UDP buffer size |
+| `recvBufferSize` | 1500 | UDP buffer size (wire MTU budget) |
 | `discoverySendPeriod` (config.yml `discovery_period_seconds`) | 2s | Discovery heartbeat interval — overridable, falls back on invalid |
 | `participantTimeout` (config.yml `participant_timeout_seconds`) | 10s | Participant aliveness timeout — overridable, falls back on invalid |
 | cleanup cadence (`max(timeout/2, 1s)`) | 5s | Participant cleanup timer interval (derived from the configured timeout) |
 | `magicNumber` | 0xED75E1ED | Packet integrity check |
+| `receiverThreads` (config.yml `receiver_threads`) | 1 | Socket-draining threads (ADR-003; `[1,4]`, keep 1) |
+| `workerThreads` (config.yml `worker_threads`) | 4 | Shard/ring/registry-shard worker count N (`[1,16]`) — the receive-parallelism lever |
+| `rxRingSlots` (config.yml `rx_ring_slots`) | 4096 | Slots per worker's bounded SPSC ring (power of two) |
+| `soRcvbufBytes` (config.yml `so_rcvbuf_bytes`) | 0 | `SO_RCVBUF` on the multicast socket; 0 = OS default |
 
 ## CMake Build System
 
@@ -258,16 +276,40 @@ Edriel Instance
 ├── std::unique_ptr<steady_timer> autoDiscoveryCleanUpTimer
 ├── asio::ip::udp::endpoint multicastEndpoint  // config-derived (multicastAddress:port)
 ├── asio::ip::udp::endpoint receiverEndpoint   // config-derived (any:port)
-├── edriel::Config config_                     // parsed runtime config (port + multicast + cadence)
+├── edriel::Config config_                     // parsed runtime config (port + multicast + cadence + ADR-003 keys)
 ├── autoDiscovery::Message discoveryMessage
 ├── std::string discoveryPacket
 ├── std::atomic_bool isRunning
 ├── std::mutex runnerMutex
-├── std::set<Participant> participants
+├── std::unordered_map<uint64_t, Participant> participants   // O(1), keyed by uid (ADR-003)
+├── ReceiverDrainer receiver_                                     // 1 socket-drain thread (ADR-003)
+├── std::vector<SPSCRing> rings_            // N bounded SPSC rings (workerThreads)
+├── std::vector<WorkerShard> shards_        // N registry shards, each with own mutex
 └── Participant selfParticipant_
 ```
 
 ## Performance Considerations
+
+### Sharded SPSC Receive Pipeline (ADR-003)
+
+The best-effort receive path is decoupled into a *transport* stage (copy a raw
+frame off the socket) and a *semantic* stage (parse + dispatch), run per-shard:
+
+- **One receiver thread** drains the socket into N bounded SPSC rings and
+  re-arms immediately (no more re-arm-after-parse gap → the kernel socket
+  buffer no longer overruns during parsing).
+- **N worker threads** each own one SPSC ring and a registry shard with its
+  own mutex — no global `stateMutex` on the hot path, so parallel dispatch is
+  real. Frames route to a worker by hashing the topic name (`worker = hash(topic) % N`),
+  preserving per-topic ordering on a single worker.
+- **Key pinning** keeps per-(publisher, topic) ordering intact; the reliable
+  gRPC path shares the same sharded registry by the same hash, so its
+  exactly-once reorder windows stay single-writer.
+- **Overflow is observable, never silent**: a full ring drops the *oldest*
+  slot and the counter is surfaced; kernel `SO_RXQ_OVFL` overruns are folded
+  into the same counter, so `droppedFrames()` equals end-to-end loss exactly.
+- `worker_threads=1` reproduces the exact pre-ADR-003 single-threaded
+  ordering (back-compat).
 
 ### Multicast Broadcasting
 - Uses ASIO's async operations for non-blocking sends
@@ -277,13 +319,24 @@ Edriel Instance
 
 ### Memory Efficiency
 - Fixed-size receive buffers (1500 bytes)
-- Participant data in `std::set` with heap allocation
-- Topic registry uses hash map for O(1) lookup
+- Participant data in an O(1) `unordered_map` keyed by uid (ADR-003)
+- Topic registry uses a hash map for O(1) lookup, sharded per worker
 
 ### gRPC Efficiency
 - Server-side streaming reduces latency
 - Initial response provides immediate data
 - Periodic polling balances update frequency vs overhead
+
+## Measured Receive Throughput (N=4, ADR-003)
+
+Fresh two-node *flood* benchmark (`Benchmark.TwoNodeReceiveThroughput`,
+`worker_threads=4`, 4 shard-distinct topics, 256 B payload, loopback
+multicast): the consumer's **true unpushed max received ≈ 527k msgs/s**
+(fresh runs 509k / 527k / 540k; best one-second delivered window) with
+~30–40% loss at that genuinely saturated operating point — the old *paced*
+figure was ~211k and the pre-ADR-003 single-node *receive* path measured
+~1–2k msgs/s. The ADR-003 hard gate (≥ 1.5× the ~118k two-node baseline =
+≥ 177k) passes in every run.
 
 ## Security Considerations
 
@@ -300,15 +353,18 @@ Edriel Instance
 ## Future Enhancements
 
 ### QoS Support
-- Reliable vs best-effort message modes
+- ~~Reliable vs best-effort message modes~~ — **done (ADR-0002)**: opt-in reliable
+  QoS delivers ordered, exactly-once, backpressured frames over a gRPC unicast
+  path.
 - Message priority levels
-- Acknowledgment mechanisms
+- Acknowledgment / NACK / replay mechanisms
 
 ### Advanced Topic Exchange
-- Hash-based topic indexing
+- Hash-based topic indexing — **done (ADR-003)** for shard routing
 - LRU caching for topic state
 - Topic compression
 
 ### Configuration
 - Multi-network interface support
-- Live config reload without restart (config is currently read once at construction)
+- Live config reload without restart (config is currently read once at
+  construction)
