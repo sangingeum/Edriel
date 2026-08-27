@@ -320,7 +320,8 @@ Positive:
   precedent), not a single fragile address.
 - **Cross-subnet covered** by the static seed, which piggybacking alone cannot.
 - **One server per node**, one advertised port — the connection graph stays
-  small and symmetric; backpressure/ACK flow to the data source.
+  small and symmetric; backpressure/ACK flow to the data source
+  (retired — see ERRATA below).
 
 **ERRATA (2026-08):** measured evidence falsifies the claim that
 "backpressure flows naturally *to the data source*" at the API boundary.
