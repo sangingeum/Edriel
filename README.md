@@ -191,31 +191,40 @@ publisher/subscriber pair is wired via cross-injected discovery adverts and a
 subscriber-initiated gRPC dial over loopback TCP (the
 `test_reliable.cpp` pattern) — no multicast, no live network. Payloads are
 256 B unless noted. All four benchmarks are standalone gTest binaries and are
-NOT part of `ctest`. Fresh back-to-back runs:
+NOT part of `ctest`.
 
-| Metric (fresh runs, 2 consecutive)   | Run 1                              | Run 2                              |
-|--------------------------------------|------------------------------------|------------------------------------|
-| B1 publish→callback latency (128 B)  | p50 71.7 µs, p90 104 µs, p99 149 µs, max 224 µs | p50 68.2 µs, p90 102 µs, p99 187 µs, max 837 µs |
-| B2 sustained absorb rate (256 B)     | 934k msgs/s sent = received (0% drop, absorb-limited by the lag backstop) | 1.00M msgs/s sent = received (0% drop, absorb-limited) |
-| B3 fan-out, 1 pub → 8 subs (256 B)   | 1.39M msgs/s aggregate, 174,741 delivered per sub (exactly-once, all 8 fed) | 1.51M msgs/s aggregate, 188,947 delivered per sub |
-| B4 unpaced flood ceiling (256 B)     | stopped by the 50k-frame lag cap; delivered = pushed (exactly-once held) | same |
+**Metric note (2026-08 errata).** Earlier revisions of this table printed B2
+as "934k–1.04M msgs/s sent = received". Those figures were **offer rates
+mislabeled as received rates**: B2 divided the post-drain delivered count by
+the PRE-drain offer window, and an unpaced caller offers ~1M msgs/s into the
+unbounded publisher outbox in a few tens of milliseconds. B2 now reports the
+TRUE absorb rate on the same basis as B4 (delivered / active first→last
+delivery span). The corrected measurements, fresh run after the fix:
+
+| Metric (fresh run, 2026-08)          | Value                                                       |
+|--------------------------------------|-------------------------------------------------------------|
+| B1 publish→callback latency (128 B)  | p50 76.9 µs, p90 109 µs, p99 177 µs, max 594 µs             |
+| B2 offer rate (256 B)                | ~1.0–1.14M msgs/s (unpaced caller, buffered by the unbounded outbox — NOT a delivery rate) |
+| B2 TRUE absorb ceiling (256 B)       | **~86–90k msgs/s** single subscriber (delivered / active delivery span; fresh runs 90539 / 86031) |
+| B3 fan-out, 1 pub → 8 subs (256 B)   | 174,295 delivered per sub, all 8 identical (exactly-once checked: per-sub counts asserted EQUAL and ≤ sent) |
+| B4 unpaced flood ceiling (256 B)     | stopped by the 50k-frame lag cap; delivered == pushed (exactly-once held), mean ~81k msgs/s |
 
 Practical readings:
 
-- **Latency**: reliable p50 ~70 µs is roughly 2.5× the best-effort multicast
+- **Latency**: reliable p50 ~75 µs is roughly 2.5× the best-effort multicast
   p50 (~27 µs); p99 stays well under 0.2 ms. TCP loopback + gRPC CQ hop, not
   a defect.
-- **Throughput / flood ceiling**: the reliable path has NO backpressure
-  signal today — `SubscriberReactor::outbox_` (publisher side,
-  `EdrielGrpcService.cpp`) is unbounded, so an unpaced caller at ~930k–1M
-  msgs/s simply buffers whatever the stream cannot write (~340k msgs/s
-  write-out observed in early runs, growing memory). The benchmarks cap the
-  offered stream with a 50k-frame lag backstop so runs stay hermetic; until
-  a bounded outbox + real backpressure exists, treat "reliable" as
-  "lossless up to unbounded publisher-side buffering", and the meaningful
-  sustained ceiling is the STREAM WRITE-OUT rate (~340k msgs/s measured
-  without the backstop), not the offered rate. Known issue; re-base B2's
-  `kBaselineAbsorbMsgsPerSec` (90k with backstop headroom) once fixed.
+- **Throughput — two rates, do not conflate them.** An unpaced caller *offers*
+  ~1M msgs/s into the reliable path, but the single-subscriber path *absorbs*
+  only ~90k msgs/s. The difference is not dropped: `SubscriberReactor::outbox_`
+  (publisher side, `EdrielGrpcService.cpp`) is **unbounded**, so the excess
+  sits buffered in publisher memory and drains at the absorb ceiling. The
+  earlier 934k–1.04M "received" figures in this README were offer rates
+  mislabeled by a B2 metric bug (post-drain count ÷ pre-drain elapsed); they
+  never measured delivery. The meaningful sustained ceiling is the TRUE
+  absorb rate (~86–90k msgs/s single subscriber). Known issue: re-base B2's
+  `kBaselineAbsorbMsgsPerSec` (90k with 0.75x headroom) once a bounded
+  outbox + real backpressure exists.
 - **Exactly-once** holds in every mode: delivered ≤ pushed everywhere,
   fan-out delivered identical counts per subscriber, flood delivered ==
   pushed under the cap.
@@ -267,8 +276,11 @@ All registration/send functions return `false` on failure.
 By default topics are **best-effort**: `sendMessage()` writes one multicast
 datagram and makes no delivery guarantee. A topic opted into **reliable** QoS
 instead carries its traffic over a gRPC unicast path between each subscriber
-and the publisher — ordered, exactly-once per (publisher, topic), and
-backpressured to the data source.
+and the publisher — ordered and exactly-once per (publisher, topic).
+(Note: true backpressure to the data source is NOT yet implemented — the
+publisher-side outbox is unbounded and buffers overload; see the
+Reliable-QoS benchmark baseline above and the ADR-0002 errata. A bounded
+outbox with real backpressure is a planned follow-up.)
 
 Opt a topic in by passing `reliable = true` (default `false`) when
 registering:

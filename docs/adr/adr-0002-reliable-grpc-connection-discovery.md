@@ -322,6 +322,19 @@ Positive:
 - **One server per node**, one advertised port — the connection graph stays
   small and symmetric; backpressure/ACK flow to the data source.
 
+**ERRATA (2026-08):** measured evidence falsifies the claim that
+"backpressure flows naturally *to the data source*" at the API boundary.
+Benchmarks (`benchmark/benchmark_reliable.cpp`, see the README Reliable-QoS
+baseline) show the publisher-side `SubscriberReactor::outbox_` is **unbounded**:
+an unpaced caller offers ~1M msgs/s while the stream write-out / subscriber
+absorb ceiling is only ~90k msgs/s — the excess is buffered, not
+backpressured, so memory grows with the offered backlog. The connection
+direction decision above is unaffected; only the backpressure claim is
+retired. Until a bounded outbox + real backpressure lands (planned
+follow-up), treat "reliable" as "lossless up to unbounded publisher-side
+buffering" — see the README known-issue in the Reliable-QoS benchmark
+baseline.
+
 Negative:
 - **Endpoint info is LAN-visible on multicast** — acceptable on a trusted LAN,
   a stated boundary if the LAN is not trusted.

@@ -268,9 +268,25 @@ TEST(ReliableBenchmark, ThroughputMsgsPerSecond) {
     constexpr std::size_t kPayloadBytes = 256;
     const autoDiscovery::Topic msg = makePayload(kPayloadBytes);
 
+    // B4-style arrival span: the subscriber callback stamps the first and last
+    // delivery, so the rate below is the TRUE ABSORB rate (delivered / active
+    // delivery span) — not the offer rate. Earlier revisions divided the
+    // post-drain count by the pre-drain offer window, which (because the
+    // unpaced caller finishes offering in a small fraction of the drain and
+    // the publisher buffers the overload) printed the OFFER rate mislabeled
+    // as a receive rate. See README known-issue and ADR-0002 errata.
+    std::atomic<int64_t> firstUs{-1};
+    std::atomic<int64_t> lastUs{0};
     std::atomic<int64_t> receivedCount{0};
     ReliablePair pair(
         "r_thr", [&](const autoDiscovery::Topic&) {
+            const auto nowUs =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now().time_since_epoch()).count();
+            int64_t expected = -1;
+            firstUs.compare_exchange_strong(expected, nowUs,
+                                            std::memory_order_relaxed);
+            lastUs.store(nowUs, std::memory_order_relaxed);
             receivedCount.fetch_add(1, std::memory_order_relaxed);
         });
     ASSERT_TRUE(pair.awaitDial()) << "subscriber dial never landed";
@@ -318,21 +334,29 @@ TEST(ReliableBenchmark, ThroughputMsgsPerSecond) {
     }
 
     const int64_t got = receivedCount.load();
-    const double sentRate = sent * 1000.0 / elapsedMs;
-    const double recvRate = got * 1000.0 / elapsedMs;
-    // Reliable != lossless under overload: the publisher's per-stream write
-    // buffer applies backpressure/drop when the single-subscriber path cannot
-    // absorb the offered rate (the flood benchmark below finds that ceiling
-    // directly). The gap here is the OVERLOAD DROP, surfaced so it is never
-    // silent (ADR-003 decision #4 discipline applied to the reliable path).
-    const int64_t overloaded = sent - got;
+    // Offer rate: how fast the unpaced caller pushed into the (unbounded)
+    // publisher outbox — NOT the delivery rate.
+    const double offerRate = sent * 1000.0 / elapsedMs;
+    // True absorb rate: delivered / active delivery span (B4 basis).
+    const double activeS =
+        (got > 0)
+            ? static_cast<double>(lastUs.load() - firstUs.load()) / 1e6
+            : 0.0;
+    const double absorbRate = (activeS > 0.0)
+                                  ? static_cast<double>(got) / activeS
+                                  : 0.0;
+    // The reliable path currently BUFFERS overload: offer rate can exceed the
+    // absorb ceiling arbitrarily (README known-issue). Surface the gap so it
+    // is never silent (ADR-003 decision #4 discipline on the reliable path).
+    const int64_t absorbedLag = sent - got;
     std::printf(
-        "[bench] reliable throughput (%zuB): sent=%lld (%.0f msgs/s)  "
-        "received=%lld (%.0f msgs/s)  overload_dropped=%lld (%.2f%%)\n",
-        kPayloadBytes, static_cast<long long>(sent), sentRate,
-        static_cast<long long>(got), recvRate,
-        static_cast<long long>(overloaded),
-        (sent > 0) ? 100.0 * static_cast<double>(overloaded)
+        "[bench] reliable throughput (%zuB): sent=%lld  offer=%.0f msgs/s  "
+        "absorbed=%lld  ABSORB=%.0f msgs/s (active span %.3fs)  "
+        "buffered_in_outbox=%lld (%.2f%%)\n",
+        kPayloadBytes, static_cast<long long>(sent), offerRate,
+        static_cast<long long>(got), absorbRate, activeS,
+        static_cast<long long>(absorbedLag),
+        (sent > 0) ? 100.0 * static_cast<double>(absorbedLag)
                          / static_cast<double>(sent)
                    : 0.0);
     std::printf(
@@ -345,17 +369,15 @@ TEST(ReliableBenchmark, ThroughputMsgsPerSecond) {
     EXPECT_GT(got, 0);
     // Exactly-once holds: never more than offered.
     EXPECT_LE(got, sent);
-    // Regression bar vs the fresh-run baseline documented in README.md.
-    // NOTE (baseline re-base): the 330k figure was measured WITHOUT the lag
-    // backstop, when the harness offered ~930k msgs/s and the outbox buffered
-    // the rest. With the lag<=50k backstop active the offered stream is
-    // effectively absorb-limited end-to-end (~93k msgs/s observed), so the
-    // bar is set to a fresh under-backstop measurement with headroom; re-base
-    // by editing this constant only after re-running with a REAL pacing
-    // producer (see README known-issue: unbounded publisher outbox).
+    // Regression bar vs the absorb baseline documented in README.md. The
+    // baseline is the TRUE absorb rate (delivered / active delivery span,
+    // measured after the metric fix): an unpaced caller offers ~1M msgs/s but
+    // the single-subscriber path absorbs ~90k msgs/s and the rest sits in the
+    // publisher's unbounded outbox (README known-issue). Headroom 0.75x;
+    // re-base by editing this constant only after a fresh measurement.
     constexpr double kBaselineAbsorbMsgsPerSec = 90000.0;
     constexpr double kMinRecvMsgsPerSec = 0.75 * kBaselineAbsorbMsgsPerSec;
-    EXPECT_GE(recvRate, kMinRecvMsgsPerSec)
+    EXPECT_GE(absorbRate, kMinRecvMsgsPerSec)
         << "reliable absorb rate regressed vs documented baseline";
 }
 
@@ -472,9 +494,15 @@ TEST(ReliableBenchmark, FanOutToNSubscribers) {
 
     EXPECT_GT(totalReceived.load(), 0LL);      // fan-out actually delivered
     EXPECT_LE(totalReceived.load(), sent * kSubscribers);  // exactly-once bound
+    // Per-subscriber exactly-once is a CHECKED property, not a printout:
+    // every subscriber must receive an IDENTICAL count (fan-out is uniform),
+    // and that count can never exceed what was sent (no dup inflation).
+    const int64_t firstSubCount = subs.front()->received.load();
     for (const auto& entry : subs) {
         EXPECT_GT(entry->received.load(), 0LL);   // every subscriber fed
         EXPECT_LE(entry->received.load(), sent);  // <= sent (no dup inflation)
+        EXPECT_EQ(entry->received.load(), firstSubCount)
+            << "per-subscriber exactly-once violated: fan-out counts differ";
     }
 }
 
