@@ -183,6 +183,49 @@ README value reproduces directly. Reproduce with:
 ./build/Release/benchmark/benchmark --gtest_filter=Benchmark.TwoNodeReceiveThroughput
 ```
 
+## Reliable-QoS benchmark baseline
+
+Measured with `benchmark/benchmark_reliable.cpp` on the same machine (Ubuntu
+24.04, g++ 13.3, Release `-O2`), 2026-08, hermetically: each
+publisher/subscriber pair is wired via cross-injected discovery adverts and a
+subscriber-initiated gRPC dial over loopback TCP (the
+`test_reliable.cpp` pattern) — no multicast, no live network. Payloads are
+256 B unless noted. All four benchmarks are standalone gTest binaries and are
+NOT part of `ctest`. Fresh back-to-back runs:
+
+| Metric (fresh runs, 2 consecutive)   | Run 1                              | Run 2                              |
+|--------------------------------------|------------------------------------|------------------------------------|
+| B1 publish→callback latency (128 B)  | p50 71.7 µs, p90 104 µs, p99 149 µs, max 224 µs | p50 68.2 µs, p90 102 µs, p99 187 µs, max 837 µs |
+| B2 sustained absorb rate (256 B)     | 934k msgs/s sent = received (0% drop, absorb-limited by the lag backstop) | 1.00M msgs/s sent = received (0% drop, absorb-limited) |
+| B3 fan-out, 1 pub → 8 subs (256 B)   | 1.39M msgs/s aggregate, 174,741 delivered per sub (exactly-once, all 8 fed) | 1.51M msgs/s aggregate, 188,947 delivered per sub |
+| B4 unpaced flood ceiling (256 B)     | stopped by the 50k-frame lag cap; delivered = pushed (exactly-once held) | same |
+
+Practical readings:
+
+- **Latency**: reliable p50 ~70 µs is roughly 2.5× the best-effort multicast
+  p50 (~27 µs); p99 stays well under 0.2 ms. TCP loopback + gRPC CQ hop, not
+  a defect.
+- **Throughput / flood ceiling**: the reliable path has NO backpressure
+  signal today — `SubscriberReactor::outbox_` (publisher side,
+  `EdrielGrpcService.cpp`) is unbounded, so an unpaced caller at ~930k–1M
+  msgs/s simply buffers whatever the stream cannot write (~340k msgs/s
+  write-out observed in early runs, growing memory). The benchmarks cap the
+  offered stream with a 50k-frame lag backstop so runs stay hermetic; until
+  a bounded outbox + real backpressure exists, treat "reliable" as
+  "lossless up to unbounded publisher-side buffering", and the meaningful
+  sustained ceiling is the STREAM WRITE-OUT rate (~340k msgs/s measured
+  without the backstop), not the offered rate. Known issue; re-base B2's
+  `kBaselineAbsorbMsgsPerSec` (90k with backstop headroom) once fixed.
+- **Exactly-once** holds in every mode: delivered ≤ pushed everywhere,
+  fan-out delivered identical counts per subscriber, flood delivered ==
+  pushed under the cap.
+
+Reproduce with:
+
+```bash
+./build/Release/benchmark/benchmark_reliable --gtest_filter='ReliableBenchmark.*'
+```
+
 ## Core concepts
 
 - **Participant discovery** — `startAutoDiscovery()` joins the multicast group,

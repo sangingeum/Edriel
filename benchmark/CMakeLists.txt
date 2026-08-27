@@ -24,10 +24,23 @@ add_executable(benchmark
     benchmark.cpp
 )
 
-# House warn bar is mandatory for the standalone benchmark target.
+# Reliable-QoS gRPC-path benchmarks (ADR-0002). Same standalone treatment:
+# manual/perf tool, warn-clean, NOT registered with CTest.
+add_executable(benchmark_reliable
+    benchmark_reliable.cpp
+)
+
+# House warn bar is mandatory for the standalone benchmark targets.
 target_compile_options(benchmark PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_compile_options(benchmark_reliable PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 target_link_libraries(benchmark PRIVATE
+    EdrielLib
+    benchmark_messages
+    GTest::gtest_main
+)
+
+target_link_libraries(benchmark_reliable PRIVATE
     EdrielLib
     benchmark_messages
     GTest::gtest_main
