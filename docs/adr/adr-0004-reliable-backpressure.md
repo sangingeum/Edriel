@@ -146,10 +146,10 @@ mechanism itself.
 
 **Cost.** Breaks nothing if additive: keep `bool publishReliable(...)` as a
 thin wrapper (`return tryPublishReliable(...) == Sent`), migrate internals to
-the tri-state core. C++20 `std::expected` is unavailable on the house
-toolchain guarantee (C++17-era build; verify before choosing the exact type) —
-a small `enum class ReliableSendResult { Sent, Backpressured, NoSubscribers,
-NotServing }` is the honest, dependency-free shape.
+the tri-state core. `std::expected` is a C++23 facility and the house
+standard is C++20 — a small `enum class ReliableSendResult { Sent,
+Backpressured, NoSubscribers, NotServing }` is the honest, dependency-free
+shape.
 
 ### Option 2B — Blocking send (sender waits for LWM)
 
