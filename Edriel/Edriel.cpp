@@ -34,6 +34,8 @@
 #endif
 
 #include <cstdint>  // std::uint8_t / std::uint32_t
+#include <map>      // deliverability map in tryPublishReliable
+#include <chrono>   // steady_clock token bucket (ADR-0004 rate limit)
 
 namespace edriel {
 
@@ -1503,11 +1505,53 @@ bool Edriel::isKnownParticipant(std::uint32_t pid, std::uint64_t tid, std::uint6
 bool Edriel::publishReliable(const std::string& topicName,
                              const std::string& messageType,
                              const std::string& payload) {
+    // Source-compatible bool wrapper (ADR-0004 Q2): true == Sent, false ==
+    // Backpressured | NoSubscribers | NotServing. A caller that ignored the
+    // bool cannot be made worse by backpressure; today that same caller
+    // silently overruns RAM instead.
+    return tryPublishReliable(topicName, messageType, payload)
+           == ReliableSendResult::Sent;
+}
+
+ReliableSendResult Edriel::tryPublishReliable(
+    const std::string& topicName, const std::string& messageType,
+    const std::string& payload,
+    std::map<std::string, OutboxStatus>* deliverability) {
+    if (deliverability != nullptr) {
+        deliverability->clear();
+    }
     std::lock_guard<std::mutex> gLock(grpcServiceMutex_);
     if (!grpcService_) {
         std::cerr << "[Edriel] Reliable send on '" << topicName
                   << "' but no gRPC server is serving\n";
-        return false;
+        return ReliableSendResult::NotServing;
+    }
+
+    // Optional sender-side pacing ceiling (ADR-0004 Option 1D, default off
+    // when reliable_send_rate_limit == 0): a simple token bucket in frames/s.
+    // Applied BEFORE the fan-out so a paced offering never even reaches the
+    // outbox gates; the reactive backpressure (1A) above it is unaffected —
+    // pacing bounds the offering rate, backpressure bounds the backlog.
+    if (config_.reliableSendRateLimit != 0) {
+        std::lock_guard<std::mutex> lock(rateLimitMutex_);
+        const auto now = std::chrono::steady_clock::now();
+        if (rateLimitLastRefill_ == std::chrono::steady_clock::time_point{}) {
+            rateLimitLastRefill_ = now;  // first paced send: bucket starts full
+        }
+        const auto elapsed = now - rateLimitLastRefill_;
+        const double refill = std::chrono::duration<double>(elapsed).count()
+                              * static_cast<double>(config_.reliableSendRateLimit);
+        if (refill >= 1.0) {
+            // Refill, capped at a full bucket of 1s worth of tokens.
+            rateLimitTokens_ = std::min(
+                rateLimitTokens_ + refill,
+                static_cast<double>(config_.reliableSendRateLimit));
+            rateLimitLastRefill_ = now;
+        }
+        if (rateLimitTokens_ < 1.0) {
+            return ReliableSendResult::Backpressured;  // paced: retry later
+        }
+        rateLimitTokens_ -= 1.0;
     }
 
     const std::string key = makeCompositeKey(topicName, messageType);
@@ -1521,15 +1565,16 @@ bool Edriel::publishReliable(const std::string& topicName,
         std::lock_guard<std::mutex> lock(shard.mux);
         const auto it = shard.topics.find(key);
         if (it == shard.topics.end() || it->second.subscribers.empty()) {
-            return false;  // no subscribers for this reliable topic
+            return ReliableSendResult::NoSubscribers;
         }
         subscribers = it->second.subscribers;
     }
     {
         // Tentative next tid (reliable path bookkeeping, off the multicast hot
-        // path). Commit only if the frame passes the MTU guard below, so a
-        // locally-rejected (never placed on the wire) frame cannot consume a
-        // sequence number and permanently gap a subscriber's window.
+        // path). ADR-0004 Q3 rule 1: committed only AFTER the frame has been
+        // accepted (enqueued to at least one live subscriber) — a backpressured
+        // frame must NOT consume its tid, or every subscriber's exactly-once
+        // window would wait forever on a tid that never arrives.
         std::lock_guard<std::mutex> lock(reliableMutex_);
         nextSeq = reliablePublisherSeq_[key] + 1;
     }
@@ -1547,7 +1592,7 @@ bool Edriel::publishReliable(const std::string& topicName,
     std::string serialized;
     if (!data.SerializeToString(&serialized)) {
         std::cerr << "[Edriel] Failed to serialize reliable frame\n";
-        return false;
+        return ReliableSendResult::NotServing;
     }
 
     // Same 1500-byte payload MTU budget as the multicast path (ADR-0002,
@@ -1557,26 +1602,53 @@ bool Edriel::publishReliable(const std::string& topicName,
         std::cerr << "[Edriel] Reliable frame for '" << topicName << "' is "
                   << serialized.size() << " bytes, exceeds "
                   << recvBufferSize << "-byte MTU budget, dropping\n";
-        return false;
+        return ReliableSendResult::NotServing;
     }
 
-    // Commit the sequence number now that the frame is guaranteed to be sent
-    // (sends are serialized by grpcServiceMutex_, so no two threads race here).
-    {
-        std::lock_guard<std::mutex> lock(reliableMutex_);
-        reliablePublisherSeq_[key] = nextSeq;
-    }
-
-    bool pushedAny = false;
+    // Fan out per subscriber (Q4 4A best-effort, Q5 fairness: each
+    // subscriber's outbox/backpressure state is strictly its own). Track
+    // whether at least one live subscriber ACCEPTED: the tid commits only on
+    // that (Q3 rule 3). A subscriber refused at its HWM was never offered the
+    // tid (pre-commit refusal), so the same-tid retry that follows re-offers
+    // it cleanly; subscribers that already accepted see the same tid twice,
+    // which their dedup window absorbs as the duplicate it is.
+    bool acceptedAny = false;
+    bool anyLiveBackpressured = false;
     for (const Participant& sub : subscribers) {
         autoDiscovery::ParticipantData frame;
         frame.set_reliable_data(serialized);
         const SubscriberKey sk{static_cast<std::uint32_t>(sub.pid), sub.tid, sub.uid};
-        if (grpcService_->pushData(sk, std::move(frame))) {
-            pushedAny = true;
+        const OutboxStatus st = grpcService_->pushData(sk, std::move(frame));
+        if (deliverability != nullptr) {
+            (*deliverability)[std::to_string(sk.pid) + ":" + std::to_string(sk.tid)
+                              + ":" + std::to_string(sk.uid)] = st;
         }
+        if (st == OutboxStatus::Accepted) {
+            acceptedAny = true;
+        } else if (st == OutboxStatus::Backpressured) {
+            anyLiveBackpressured = true;
+        }
+        // NotConnected: the stream is gone (teardown race) — that subscriber
+        // is not live, and per Q4 only LIVE subscribers' refusals count.
     }
-    return pushedAny;
+
+    if (acceptedAny) {
+        // Commit the sequence number now that the frame is guaranteed placed
+        // on at least one stream (sends are serialized by grpcServiceMutex_,
+        // so no two threads race here) — ADR-0004 Q3 commit-after-acceptance.
+        std::lock_guard<std::mutex> lock(reliableMutex_);
+        reliablePublisherSeq_[key] = nextSeq;
+        return ReliableSendResult::Sent;
+    }
+    if (anyLiveBackpressured) {
+        // Every live subscriber is at its HWM: clean, pre-commit, retryable
+        // state. reliablePublisherSeq_[key] stays at nextSeq - 1, so a retry
+        // re-stamps the SAME tid (Q3 rule 2).
+        return ReliableSendResult::Backpressured;
+    }
+    // No live subscriber refused on backpressure and none accepted: they are
+    // all gone (registry stale / teardown races). Same as pushedAny=false.
+    return ReliableSendResult::NoSubscribers;
 }
 
 void Edriel::handleReliableDataFrame(const autoDiscovery::ParticipantData& pd) {

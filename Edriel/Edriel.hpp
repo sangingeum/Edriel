@@ -30,6 +30,8 @@
 #include "EdrielGrpcService.hpp"
 #include "EdrielRing.hpp"
 
+#include <cstddef>
+
 // ============================================================================
 // Topic Info Structure
 // ============================================================================
@@ -268,6 +270,13 @@ private:
     mutable std::map<std::string, ReliableRxWindow> reliableWindows_;
     /// Per-(publisher,topic) monotonic sequence stamps (reuses Identifier.tid).
     std::map<std::string, std::uint64_t> reliablePublisherSeq_;
+
+    // ADR-0004 Option 1D: optional sender-side pacing ceiling (token bucket).
+    // Guarded by its own mutex (rateLimitMutex_); only touched inside
+    // tryPublishReliable under grpcServiceMutex_, so it never contends.
+    mutable std::mutex rateLimitMutex_;
+    double rateLimitTokens_ = 0.0;  ///< accumulated tokens (frames)
+    std::chrono::steady_clock::time_point rateLimitLastRefill_{};
     /// Composite keys of topics this node subscribes to with reliable QoS;
     /// these drive which publishers this node dials.
     std::set<std::string> reliableSubscribedTopics_;
@@ -403,10 +412,35 @@ private:
     const Participant& selfIdentityForTest() const {
         return selfParticipant;
     }
+    /// This node's validated runtime configuration (used by the gRPC service
+    /// layer to read the ADR-0004 bounded-outbox knobs; also a test hook).
+    const Config& config() const {
+        return config_;
+    }
     /// Whether a subscriber stream for `key` is currently registered on this
     /// node's server (test hook to wait for the reliable dial to land).
     bool subscriberConnectedForTest(const SubscriberKey& key) const {
         return grpcService_ && grpcService_->hasSubscriber(key);
+    }
+    /// ADR-0004 2C `isSendable()` probe: can the subscriber identified by
+    /// `key` currently accept a reliable frame (live, below the outbox
+    /// high-water mark)? The LWM-resume surface for caller retry loops.
+    bool isSendable(const SubscriberKey& key) const {
+        return grpcService_ && grpcService_->isSendable(key);
+    }
+    /// ADR-0004 diagnostic/test probe: the outbox depth of the subscriber
+    /// identified by `key` (0 when not connected). Drives the Q7
+    /// bounded-memory assertions.
+    std::size_t subscriberOutboxDepthForTest(const SubscriberKey& key) const {
+        return grpcService_ ? grpcService_->outboxDepth(key) : 0;
+    }
+    /// ADR-0004 test hook: the last committed per-(topic, message-type)
+    /// publisher tid for this node's reliable sends (0 = none committed).
+    /// Drives the Q7 "a backpressured frame must NOT consume its tid" assert.
+    std::uint64_t reliablePublisherSeqForTest(const std::string& key) const {
+        std::lock_guard<std::mutex> lock(reliableMutex_);
+        const auto it = reliablePublisherSeq_.find(key);
+        return it != reliablePublisherSeq_.end() ? it->second : 0;
     }
     void deliverForTest(const autoDiscovery::Message& msg) {
         handleAutoDiscoveryParse(msg);
@@ -442,6 +476,32 @@ private:
         }
         return total;
     }
+
+    /**
+     * @brief Tri-state reliable send (ADR-0004 Option 2A): the honest caller
+     * surface that distinguishes "accepted by at least one live subscriber"
+     * from "every live subscriber's outbox is at its high-water mark (retry
+     * later; the tid was NOT consumed)" from "nobody is listening / not
+     * serving". On `Backpressured` the caller re-invokes with the SAME payload:
+     * the retry re-stamps the same tid (commit-after-acceptance, Q3), so no
+     * window gap is ever created and the receiver dedup window absorbs any
+     * duplicate on the wire.
+     * @param deliverability Optional out-param: per-subscriber outcome map
+     *        (Q4 4A), subscriberKey -> OutboxStatus, for callers that need
+     *        per-subscriber detail (empty when NoSubscribers/NotServing).
+     */
+    ReliableSendResult tryPublishReliable(
+        const std::string& topicName, const std::string& messageType,
+        const std::string& payload,
+        std::map<std::string, OutboxStatus>* deliverability = nullptr);
+
+    /**
+     * @brief Source-compatible bool wrapper over tryPublishReliable (ADR-0004
+     * Q2): true == Sent, false == Backpressured | NoSubscribers | NotServing.
+     */
+    bool publishReliable(const std::string& topicName,
+                         const std::string& messageType,
+                         const std::string& payload);
 
   private:
     // ========================================================================
@@ -592,16 +652,6 @@ private:
      */
     bool publishData(const std::string& topicName, const std::string& messageType,
                      const std::string& payload);
-
-    /**
-     * @brief Pushes a reliable DataMessage over the subscriber streams of a
-     * topic. Stamps a per-(publisher,topic) tid (reusing Identifier.tid) so the
-     * receiver can dedup/reorder to exactly-once. Serves from the gRPC server's
-     * subscriber table (publisher side of subscriber-initiated dialing).
-     * @return true if pushed to at least one connected subscriber
-     */
-    bool publishReliable(const std::string& topicName, const std::string& messageType,
-                         const std::string& payload);
 
     /**
      * @brief Reconciles the subscriber-client connection set against the

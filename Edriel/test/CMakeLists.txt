@@ -138,3 +138,16 @@ target_link_libraries(test_reliable PRIVATE
 )
 
 add_test(NAME TestReliable COMMAND test_reliable)
+
+# test_backpressure: ADR-0004 bounded-outbox backpressure (HWM/LWM stall,
+# same-tid retry exactly-once, fairness, tri-state surface, isSendable probe)
+add_executable(test_backpressure
+    test_backpressure.cpp
+)
+target_compile_options(test_backpressure PRIVATE ${EDRIEL_STRICT_FLAGS})
+target_link_libraries(test_backpressure PRIVATE
+    EdrielLib
+    GTest::gtest_main
+)
+
+add_test(NAME TestBackpressure COMMAND test_backpressure)
