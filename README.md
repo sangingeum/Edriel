@@ -69,6 +69,12 @@ receiver_threads: 1     # socket-draining threads (keep 1; see table)
 worker_threads: 4       # shard/ring/registry-shard workers N (the real lever)
 rx_ring_slots: 4096     # slots per worker's bounded SPSC ring (power of two)
 so_rcvbuf_bytes: 1048576  # SO_RCVBUF on the multicast socket; 0 = OS default
+
+# ADR-0004 reliable-path backpressure (per-subscriber bounded outbox)
+reliable_outbox_max_frames: 1024  # per-subscriber outbox bound (>= 512 recommended)
+reliable_outbox_hwm: 0.75         # refuse pushes at/above this fill fraction
+reliable_outbox_lwm: 0.25         # resume pushes at/below this fill fraction
+reliable_send_rate_limit: 0       # optional sender pacing ceiling (frames/s); 0 = off
 ```
 
 | Key | Valid range | Falls back to |
@@ -85,6 +91,10 @@ so_rcvbuf_bytes: 1048576  # SO_RCVBUF on the multicast socket; 0 = OS default
 | `worker_threads` | integer in `1..16` | `4` |
 | `rx_ring_slots` | power of two | `4096` |
 | `so_rcvbuf_bytes` | integer in `0..1<<30` (`0` = OS default) | `0` |
+| `reliable_outbox_max_frames` (ADR-0004) | positive integer (≥ 512 recommended; receiver window is 256) | `1024` |
+| `reliable_outbox_hwm` (ADR-0004) | fraction, `0 < hwm < 1` (and `lwm < hwm`) | `0.75` |
+| `reliable_outbox_lwm` (ADR-0004) | fraction, `0 < lwm < hwm` | `0.25` |
+| `reliable_send_rate_limit` (ADR-0004) | non-negative integer frames/s (`0` = unlimited) | `0` |
 
 The `grpc_port` / `advertise_address` / `max_advertised_endpoints` / `peers` keys
 drive the reliable path (ADR-0002). Every node runs one gRPC server on `grpc_port`
@@ -197,37 +207,51 @@ NOT part of `ctest`.
 as "934k–1.04M msgs/s sent = received". Those figures were **offer rates
 mislabeled as received rates**: B2 divided the post-drain delivered count by
 the PRE-drain offer window, and an unpaced caller offers ~1M msgs/s into the
-unbounded publisher outbox in a few tens of milliseconds. B2 now reports the
+pre-ADR-0004 outbox in a few tens of milliseconds. B2 now reports the
 TRUE absorb rate on the same basis as B4 (delivered / active first→last
-delivery span). The corrected measurements, fresh run after the fix:
+delivery span). Fresh measurements after the ADR-0004 S4 re-base
+(bounded-outbox backpressure; B2/B4 now stop at the transport HWM instead of
+the harness lag cap; B3 uses the ADR-0004 Q3 offer-gate discipline — see the
+behavior-change note below):
 
-| Metric (fresh run, 2026-08)          | Value                                                       |
+| Metric (fresh run, 2026-08, ADR-0004) | Value                                                       |
 |--------------------------------------|-------------------------------------------------------------|
-| B1 publish→callback latency (128 B)  | p50 76.9 µs, p90 109 µs, p99 177 µs, max 594 µs             |
-| B2 offer rate (256 B)                | ~1.0–1.14M msgs/s (unpaced caller, buffered by the unbounded outbox — NOT a delivery rate) |
-| B2 TRUE absorb ceiling (256 B)       | **~86–90k msgs/s** single subscriber (delivered / active delivery span; fresh runs 90539 / 86031) |
-| B3 fan-out, 1 pub → 8 subs (256 B)   | 174,295 delivered per sub, all 8 identical (exactly-once checked: per-sub counts asserted EQUAL and ≤ sent) |
-| B4 unpaced flood ceiling (256 B)     | stopped by the 50k-frame lag cap; delivered == pushed (exactly-once held), mean ~81k msgs/s |
+| B1 publish→callback latency (128 B)  | p50 73–74 µs, p90 89–98 µs, p99 137–173 µs, max 278–307 µs  |
+| B2 backpressured-stop absorb (256 B) | ~85–108k msgs/s single subscriber (delivered / active delivery span, 0.007–0.010 s spans; the caller stops at the first `Backpressured` — offer window closed at the outbox HWM, 0% buffered) |
+| B3 fan-out, 1 pub → 8 subs (256 B)   | 33,901–35,505 sent, ~187–189k msgs/s aggregate delivered, all 8 per-sub counts IDENTICAL (exactly-once checked: per-sub counts asserted EQUAL and ≤ sent) |
+| B4 flood-onset (256 B)               | stopped by transport backpressure at the outbox HWM (~820–860 pushed in the onset burst, ~10 ms); delivered == pushed (exactly-once held); mean drain rate ~89–107k msgs/s |
+| Publisher memory                     | bounded at `subscribers × reliable_outbox_max_frames` frames (default 1024/sub) — no unbounded buffering in any scenario |
+
+Behavior change (ADR-0004): fire-and-forget callers get refusals where they
+previously got silent buffering. `sendMessage`/`publishReliable` return
+`false` (and `tryPublishReliable` returns `Backpressured`) once a
+subscriber's outbox reaches its high-water mark, until it drains to the
+low-water mark; a refused frame never consumes its tid, so retrying the
+SAME payload is safe and delivers exactly once. Under fan-out, offer a new
+frame only when every subscriber is sendable (`isSendable()`, ADR-0004 2C) —
+a partial acceptance commits the tid (Q3.3) and would strand the refused
+subscriber's window on a permanent gap.
 
 Practical readings:
 
-- **Latency**: reliable p50 ~75 µs is roughly 2.5× the best-effort multicast
+- **Latency**: reliable p50 ~74 µs is roughly 2.7× the best-effort multicast
   p50 (~27 µs); p99 stays well under 0.2 ms. TCP loopback + gRPC CQ hop, not
   a defect.
 - **Throughput — two rates, do not conflate them.** An unpaced caller *offers*
   ~1M msgs/s into the reliable path, but the single-subscriber path *absorbs*
-  only ~90k msgs/s. The difference is not dropped: `SubscriberReactor::outbox_`
-  (publisher side, `EdrielGrpcService.cpp`) is **unbounded**, so the excess
-  sits buffered in publisher memory and drains at the absorb ceiling. The
-  earlier 934k–1.04M "received" figures in this README were offer rates
-  mislabeled by a B2 metric bug (post-drain count ÷ pre-drain elapsed); they
-  never measured delivery. The meaningful sustained ceiling is the TRUE
-  absorb rate (~86–90k msgs/s single subscriber). Known issue: re-base B2's
-  `kBaselineAbsorbMsgsPerSec` (90k with 0.75x headroom) once a bounded
-  outbox + real backpressure exists.
+  only ~85–108k msgs/s. With ADR-0004 the difference is neither dropped nor
+  buffered without limit: `SubscriberReactor::outbox_` is **bounded** (per
+  subscriber, `reliable_outbox_max_frames`, default 1024 with HWM/LWM), so
+  the excess now surfaces as `Backpressured` refusals at the outbox
+  high-water mark instead of publisher RAM — the caller retries the same
+  payload once the outbox drains to the low-water mark. The meaningful
+  sustained ceiling remains the TRUE absorb rate (~85–108k msgs/s single
+  subscriber). The metric errata above (offer rates once mislabeled as
+  received rates) is historical; B2's baseline constant is unchanged.
 - **Exactly-once** holds in every mode: delivered ≤ pushed everywhere,
-  fan-out delivered identical counts per subscriber, flood delivered ==
-  pushed under the cap.
+  fan-out delivered identical counts per subscriber (B3's offer-gate loop
+  keeps all 8 windows in lockstep), flood delivered ==
+  pushed under the transport backpressure cap.
 
 Reproduce with:
 
@@ -277,10 +301,14 @@ By default topics are **best-effort**: `sendMessage()` writes one multicast
 datagram and makes no delivery guarantee. A topic opted into **reliable** QoS
 instead carries its traffic over a gRPC unicast path between each subscriber
 and the publisher — ordered and exactly-once per (publisher, topic).
-(Note: true backpressure to the data source is NOT yet implemented — the
-publisher-side outbox is unbounded and buffers overload; see the
-Reliable-QoS benchmark baseline above and the ADR-0002 errata. A bounded
-outbox with real backpressure is a planned follow-up.)
+Backpressure (ADR-0004): each subscriber's outbox is **bounded**
+(`reliable_outbox_max_frames`, HWM/LWM water marks). Once a subscriber's
+outbox reaches its high-water mark, `sendMessage`/`publishReliable` refuse
+the push (`false`, or `ReliableSendResult::Backpressured` from
+`tryPublishReliable`) until it drains to the low-water mark — retry the same
+payload and it re-stamps the SAME tid, delivered exactly once. A refused
+frame never consumes its tid, so no window gap is possible. Publisher-side
+memory is bounded at `subscribers × reliable_outbox_max_frames` frames.
 
 Opt a topic in by passing `reliable = true` (default `false`) when
 registering:

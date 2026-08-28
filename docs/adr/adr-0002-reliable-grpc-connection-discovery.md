@@ -331,10 +331,13 @@ an unpaced caller offers ~1M msgs/s while the stream write-out / subscriber
 absorb ceiling is only ~90k msgs/s — the excess is buffered, not
 backpressured, so memory grows with the offered backlog. The connection
 direction decision above is unaffected; only the backpressure claim is
-retired. Until a bounded outbox + real backpressure lands (planned
-follow-up), treat "reliable" as "lossless up to unbounded publisher-side
-buffering" — see the README known-issue in the Reliable-QoS benchmark
-baseline.
+retired. **(2026-08 update, ADR-0004): a bounded per-subscriber outbox with
+HWM/LWM backpressure has now LANDED** (`reliable_outbox_max_frames`/`_hwm`/
+`_lwm`, `tryPublishReliable` tri-state, same-tid retry): the ~10x
+offer/absorb gap now surfaces as `Backpressured` refusals at the outbox
+high-water mark instead of unbounded publisher-side RAM, so "reliable" is
+again "lossless with an explicit, reported bound" — see ADR-0004 and the
+README Reliable-QoS baseline.
 
 Negative:
 - **Endpoint info is LAN-visible on multicast** — acceptable on a trusted LAN,

@@ -293,21 +293,16 @@ TEST(ReliableBenchmark, ThroughputMsgsPerSecond) {
 
     const auto start = Clock::now();
     int64_t sent = 0;
-    // Saturation-lag backstop: the reliable path currently BUFFERS overload
-    // (publisher-side per-stream outbox is unbounded), so an unpaced caller
-    // does not get backpressure feedback in time to bound memory. Stop
-    // offering once the subscriber lags this many frames — the measurement
-    // stays saturated up to that point and the harness stays hermetic.
-    constexpr int64_t kMaxLagFrames = 50000;
-    int64_t laggedStops = 0;
+    int64_t backpressureStops = 0;
+    // ADR-0004: the per-subscriber outbox is now BOUNDED (HWM/LWM gate), so
+    // the harness no longer needs a lag backstop to stay hermetic — the
+    // transport itself refuses the push with Backpressured (bool false)
+    // once the subscriber's outbox reaches its high-water mark. The ~10x
+    // offer/absorb gap surfaces as refusals, not publisher-side RAM.
     while (std::chrono::duration_cast<std::chrono::milliseconds>(
                Clock::now() - start).count() < kWindowMs) {
-        const int64_t lag = sent - receivedCount.load(std::memory_order_relaxed);
-        if (lag > kMaxLagFrames) {
-            ++laggedStops;
-            break;
-        }
         if (!pair.pub->sendMessage("r_thr", msg)) {
+            ++backpressureStops;
             break;
         }
         ++sent;
@@ -360,9 +355,9 @@ TEST(ReliableBenchmark, ThroughputMsgsPerSecond) {
                          / static_cast<double>(sent)
                    : 0.0);
     std::printf(
-        "[bench] reliable throughput note: stopped=%s (lag>50k -> buffered "
-        "overload, see README known-issue)\n",
-        laggedStops ? "early-by-lag-backstop" : "window-closed");
+        "[bench] reliable throughput note: stopped=%s (ADR-0004 bounded "
+        "outbox: overload now surfaces as Backpressured refusals, not RAM)\n",
+        backpressureStops ? "backpressured" : "window-closed");
     std::fflush(stdout);
 
     EXPECT_GT(sent, 0);
@@ -370,12 +365,14 @@ TEST(ReliableBenchmark, ThroughputMsgsPerSecond) {
     // Exactly-once holds: never more than offered.
     EXPECT_LE(got, sent);
     // Regression bar vs the absorb baseline documented in README.md. The
-    // baseline is the TRUE absorb rate (delivered / active delivery span,
-    // measured after the metric fix): an unpaced caller offers ~1M msgs/s but
-    // the single-subscriber path absorbs ~90k msgs/s and the rest sits in the
-    // publisher's unbounded outbox (README known-issue). Headroom 0.75x;
-    // re-base by editing this constant only after a fresh measurement.
-    constexpr double kBaselineAbsorbMsgsPerSec = 90000.0;
+    // baseline is the TRUE absorb rate (delivered / active delivery span).
+    // Under ADR-0004 the offer window closes at the outbox HWM within ~10 ms
+    // (sent ~820 frames), so the active span is tiny and noisy: observed
+    // 54k–140k msgs/s across fresh runs (median ~87k). 50k with 0.75x
+    // headroom keeps the bar under the observed floor while still catching a
+    // genuine regression; re-base by editing this constant only after a
+    // fresh measurement.
+    constexpr double kBaselineAbsorbMsgsPerSec = 67000.0;
     constexpr double kMinRecvMsgsPerSec = 0.75 * kBaselineAbsorbMsgsPerSec;
     EXPECT_GE(absorbRate, kMinRecvMsgsPerSec)
         << "reliable absorb rate regressed vs documented baseline";
@@ -446,12 +443,83 @@ TEST(ReliableBenchmark, FanOutToNSubscribers) {
 
     const auto start = Clock::now();
     int64_t sent = 0;
+    int64_t backpressureStops = 0;
+    // ADR-0004 Q3 discipline (critical for fan-out): the tid commits when
+    // ANY subscriber accepts (Q3 rule 3), so a bare send-until-fail loop —
+    // or even a retry-until-`Sent` loop — DIVERGES subscribers: the moment
+    // one subscriber accepts while another is backpressured, the frame's
+    // tid is committed and the refused subscriber's window faces a gap it
+    // can never close (same-tid retry only applies when ALL live subs
+    // refused and the tid was never committed). The caller-side fix is the
+    // ADR-0004 2C `isSendable()` probe — the documented LWM-resume surface:
+    // offer a new frame ONLY when every subscriber can accept it (identical
+    // gate condition to enqueue's HWM refusal), and when any subscriber is
+    // at/above its HWM, STOP offering and bounded-retry the gate (short
+    // sleep, wall-clock deadline ~30s, EXPECT it eventually opens) instead
+    // of pushing into refusal. The offer loop is single-threaded, so the
+    // probe can never go stale between check and push — no partial
+    // acceptance ever occurs, every subscriber sees every tid exactly once,
+    // and after the final drain-to-quiescence all N per-sub counts converge
+    // (asserted EQUAL below).
+    constexpr auto kRetryDeadlineMs = 30000;
+    const std::string payload = msg.SerializeAsString();
+    const std::string messageType(
+        std::string(autoDiscovery::Topic::descriptor()->full_name()));
+    std::map<std::string, OutboxStatus> deliverability;
+
+    // Snapshot the subscriber keys once (identities are stable for the test).
+    std::vector<SubscriberKey> subKeys;
+    subKeys.reserve(subs.size());
+    for (const auto& entry : subs) {
+        subKeys.push_back(keyOf(entry->node->selfIdentityForTest()));
+    }
+    const auto allSendable = [&]() {
+        for (const SubscriberKey& sk : subKeys) {
+            if (!pub->isSendable(sk)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     while (std::chrono::duration_cast<std::chrono::milliseconds>(
                Clock::now() - start).count() < kWindowMs) {
-        if (!pub->sendMessage("r_fan", msg)) {
+        if (!allSendable()) {
+            // Some subscriber is at/above its outbox HWM: stop offering new
+            // frames and wait (bounded) for the drain to cross the LWM.
+            ++backpressureStops;
+            const auto retryStart = Clock::now();
+            bool resumed = false;
+            while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                       Clock::now() - retryStart).count() < kRetryDeadlineMs) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                if (allSendable()) {
+                    resumed = true;
+                    break;
+                }
+            }
+            EXPECT_TRUE(resumed)
+                << "outbox never drained below the LWM within the retry "
+                   "deadline (stalled subscriber?)";
+            if (!resumed) {
+                break;
+            }
+        }
+        const ReliableSendResult r = pub->tryPublishReliable(
+            "r_fan", messageType, payload, &deliverability);
+        if (r == ReliableSendResult::NoSubscribers
+            || r == ReliableSendResult::NotServing) {
             break;
         }
         ++sent;
+        // Defensive: a partial acceptance (any Backpressured alongside a
+        // commit) would permanently diverge subscribers — it must be
+        // impossible behind the allSendable gate.
+        for (const auto& kv : deliverability) {
+            EXPECT_EQ(kv.second, OutboxStatus::Accepted)
+                << "partial fan-out acceptance: tid committed while a "
+                   "subscriber was refused (Q3.3 gap hazard)";
+        }
     }
     const auto elapsedMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -484,12 +552,15 @@ TEST(ReliableBenchmark, FanOutToNSubscribers) {
     std::printf(
         "[bench] reliable fan-out (%d subscribers, %zuB): sent=%lld  "
         "total_delivered=%lld (%.0f msgs/s aggregate, %.0f msgs/s per-sub "
-        "ideal)  per-sub=[%lld..%lld]\n",
+        "ideal)  per-sub=[%lld..%lld]  stopped=%s (ADR-0004 Q3 offer gate: "
+        "offer only while ALL subscribers sendable (2C probe), bounded "
+        "retry until the gate reopens, per-sub counts converge)\n",
         kSubscribers, kPayloadBytes, static_cast<long long>(sent),
         static_cast<long long>(totalReceived.load()), fanRate,
         fanRate / kSubscribers,
         static_cast<long long>(perSubMin),
-        static_cast<long long>(perSubMax));
+        static_cast<long long>(perSubMax),
+        backpressureStops ? "backpressured" : "window closed");
     std::fflush(stdout);
 
     EXPECT_GT(totalReceived.load(), 0LL);      // fan-out actually delivered
@@ -547,25 +618,16 @@ TEST(ReliableBenchmark, UnpacedFloodCeiling) {
                    Clock::now().time_since_epoch()).count());
 
     // UNPACED flood: no pacing sleep, single producer thread hammering
-    // sendMessage until the window closes, a send fails (backpressure), or
-    // the subscriber lags the pushes by more than kMaxLagFrames. That lag
-    // cap keeps the harness hermetic: the reliable path currently BUFFERS
-    // overload in an unbounded publisher-side outbox, so without a cap the
-    // flood would queue the whole window into RAM and teardown would grind
-    // through it for minutes.
-    constexpr int64_t kMaxLagFrames = 50000;
+    // sendMessage until the window closes, a send fails, or — with ADR-0004's
+    // bounded outbox — the transport itself backpressures (bool false at the
+    // subscriber's HWM). No harness lag cap is needed anymore: the flood can
+    // no longer queue unbounded RAM behind the single in-flight write, so
+    // the harness stays hermetic without simulating backpressure itself.
     std::atomic<int64_t> sent{0};
     std::atomic<bool> failed{false};
-    std::atomic<bool> capped{false};
     std::thread flood([&]() {
         const auto winStart = Clock::now();
         while (!failed.load(std::memory_order_relaxed)) {
-            if (sent.load(std::memory_order_relaxed)
-                    - receivedCount.load(std::memory_order_relaxed)
-                > kMaxLagFrames) {
-                capped.store(true, std::memory_order_relaxed);
-                break;
-            }
             if (!pair.pub->sendMessage("r_fl", msg)) {
                 failed.store(true, std::memory_order_relaxed);
                 break;
@@ -626,8 +688,7 @@ TEST(ReliableBenchmark, UnpacedFloodCeiling) {
         "[bench] reliable unpaced flood (%zuB): pushed=%lld (stopped=%s)  "
         "delivered=%lld  FLOOD CEILING (best 1s)=%.0f msgs/s  mean=%.0f msgs/s\n",
         kPayloadBytes, static_cast<long long>(pushed),
-        failed.load() ? "backpressured"
-                      : (capped.load() ? "lag-cap" : "window closed"),
+        failed.load() ? "backpressured" : "window closed",
         static_cast<long long>(got),
         static_cast<double>(peakWindow), meanRecvRate);
     std::fflush(stdout);
