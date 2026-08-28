@@ -422,39 +422,74 @@ TEST(Backpressure, StalledSubscriberDoesNotGateHealthyOne) {
 
     // Send a burst far past the stalled subscriber's HWM. The stalled one
     // becomes Backpressured (its outbox full); the healthy one keeps
-    // accepting and delivering.
+    // accepting and delivering. The deliverability map (Q4 4A) records each
+    // frame's per-subscriber outcome, which is the only sound denominator for
+    // the exactly-once assertion below: a tid commits when >=1 live subscriber
+    // accepts (Q3 rule 3), so a frame counted in the committed-tid total may
+    // have been accepted solely by the STALLED subscriber while the healthy
+    // one was momentarily at its own HWM (its reactor keeps StartWrite-ing
+    // into the socket buffer even though the callback is parked, so its
+    // outbox drains and it can stay under HWM for a long stretch).
+    const std::string healthyKeyStr =
+        std::to_string(subs[1]->self.pid) + ":" + std::to_string(subs[1]->self.tid)
+        + ":" + std::to_string(subs[1]->self.uid);
+    const std::string stalledKeyStr =
+        std::to_string(subs[0]->self.pid) + ":" + std::to_string(subs[0]->self.tid)
+        + ":" + std::to_string(subs[0]->self.uid);
     int healthyAccepted = 0;
-    for (int i = 0; i < 120; ++i) {
+    int stalledAccepted = 0;
+    int stalledRefusals = 0;
+    for (int i = 0; i < 2000; ++i) {
+        std::map<std::string, OutboxStatus> deliverability;
         const ReliableSendResult r = pub.tryPublishReliable(
             "r_bp_fair", "autoDiscovery.Topic",
-            makePayloadValue("fair").SerializeAsString());
-        if (r == ReliableSendResult::Sent) {
+            makePayloadValue("fair").SerializeAsString(), &deliverability);
+        const auto hit = [&deliverability](const std::string& k) {
+            const auto it = deliverability.find(k);
+            return it != deliverability.end() ? it->second
+                                              : OutboxStatus::NotConnected;
+        };
+        if (hit(healthyKeyStr) == OutboxStatus::Accepted) {
             ++healthyAccepted;
+        }
+        if (hit(stalledKeyStr) == OutboxStatus::Accepted) {
+            ++stalledAccepted;
+        } else if (hit(stalledKeyStr) == OutboxStatus::Backpressured) {
+            ++stalledRefusals;
+        }
+        if (r == ReliableSendResult::Sent) {
+            // Keep bursting until the stalled subscriber's gate has actually
+            // engaged (bounded), so the fairness scenario is established.
+            if (stalledRefusals > 0) {
+                break;
+            }
+            continue;
         } else if (r == ReliableSendResult::Backpressured) {
-            // Q4 4A: once the stalled sub is at HWM while the healthy one has
-            // already accepted the frame, the result is Sent (≥1 accepted) —
-            // a refusal only surfaces when ALL live subscribers refuse.
-            // Backpressured here would mean the healthy sub is also full,
-            // which contradicts its continuing delivery; accept either, but
-            // the healthy subscriber MUST keep receiving below.
+            // Every live subscriber refused: both outboxes at HWM. Stop.
             break;
         } else {
             FAIL() << "unexpected send result";
         }
     }
     EXPECT_GT(healthyAccepted, 0);
+    // The backpressure gate actually engaged on the stalled subscriber at
+    // least once (otherwise this test proves nothing about fairness).
+    EXPECT_GT(stalledRefusals, 0)
+        << "stalled subscriber was never backpressured; burst too small";
 
-    // THE fairness assertion: the healthy subscriber's delivery continues
-    // (well past the stalled one's HWM-limited count) and tracks what was
-    // accepted — the stalled subscriber gated nothing. Delivery is async:
-    // wait for the accepted frames to land before comparing counters.
+    // THE fairness assertion: the healthy subscriber's delivery continues and
+    // tracks exactly what the publisher accepted FOR IT — the stalled
+    // subscriber gated nothing. Delivery is async: wait for the accepted
+    // frames to land before comparing counters. Absolute equality: every
+    // frame accepted for the healthy subscriber is delivered exactly once.
     EXPECT_TRUE(waitUntil(
         [&]() {
-            return subs[1]->received.load() >= healthyAccepted
+            return subs[1]->received.load() == healthyAccepted
                    && subs[0]->received.load() <= subs[1]->received.load();
         },
-        5000))
-        << "healthy subscriber never caught up with accepted frames";
+        10000))
+        << "healthy subscriber never caught up with frames accepted for it ("
+        << subs[1]->received.load() << " of " << healthyAccepted << ")";
     EXPECT_GT(subs[1]->received.load(), 10)
         << "healthy subscriber's delivery was gated by the stalled one";
     EXPECT_LE(subs[0]->received.load(), subs[1]->received.load())
@@ -463,7 +498,9 @@ TEST(Backpressure, StalledSubscriberDoesNotGateHealthyOne) {
     // Healthy delivery == what the publisher actually accepted for it; the
     // stalled subscriber cannot exceed its tiny drained share.
     EXPECT_EQ(subs[1]->received.load(), healthyAccepted)
-        << "healthy subscriber lost frames the publisher accepted";
+        << "healthy subscriber lost frames the publisher accepted for it";
+    EXPECT_LE(subs[0]->received.load(), stalledAccepted)
+        << "stalled subscriber delivered more than it ever accepted";
 
     // Release the stall gate so teardown never joins a blocked read thread.
     releaseAll.store(true);
