@@ -29,6 +29,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -41,6 +42,30 @@
 #include "autoDiscovery_grpc_service.pb.h"
 
 namespace edriel {
+
+/// Enqueue outcome for a reliable push into a subscriber reactor's outbox
+/// (ADR-0004 Option 1A). `Backpressured` means the outbox is at its
+/// high-water mark: the frame was NOT queued, and the push may be retried
+/// once the outbox drains to the low-water mark.
+enum class OutboxStatus {
+    Accepted,       ///< frame queued for the stream
+    Backpressured,  ///< outbox at/above HWM; frame NOT queued (retry later)
+    NotConnected,   ///< stream terminating / not registered; frame NOT queued
+};
+
+/// Tri-state reliable-send result (ADR-0004 Option 2A / Q2). The transport's
+/// answer to "did my publish land somewhere?"
+///   - Sent: at least one live subscriber accepted the frame (tid consumed).
+///   - Backpressured: every live subscriber refused at the outbox HWM; the tid
+///     was NOT consumed — retry the SAME payload later (same-tid retry, Q3).
+///   - NoSubscribers / NotServing: nobody is listening / no gRPC server
+///     (today's `false` cases); tid not consumed either.
+enum class ReliableSendResult {
+    Sent,
+    Backpressured,
+    NoSubscribers,
+    NotServing,
+};
 
 class Edriel;
 class ParticipantStreamServiceImpl;
@@ -80,8 +105,20 @@ public:
     void OnDone() override;
 
     /// Thread-safe: enqueue a ParticipantData frame for this subscriber and
-    /// kick a write if one is not already in flight.
-    void enqueue(autoDiscovery::ParticipantData&& frame);
+    /// kick a write if one is not already in flight. Refuses the frame with
+    /// `Backpressured` once the outbox is at the high-water mark until it
+    /// drains to the low-water mark (ADR-0004 Option 1A); refuses with
+    /// `NotConnected` when the stream is terminating.
+    OutboxStatus enqueue(autoDiscovery::ParticipantData&& frame);
+
+    /// Thread-safe: can this subscriber currently accept a frame — i.e. live,
+    /// not terminating, and below the outbox high-water mark (ADR-0004 2C
+    /// probe, the LWM-resume surface for caller retry loops).
+    bool isSendable();
+
+    /// Thread-safe: current outbox depth (test/diagnostic probe; ADR-0004 Q7
+    /// bounded-memory assertions).
+    std::size_t outboxDepth();
 
     /// Thread-safe: is this stream still a live, deliverable subscriber? False
     /// once teardown has begun (client cancel or terminal Finish), so the
@@ -125,6 +162,13 @@ private:
     std::deque<autoDiscovery::ParticipantData> outbox_;
     bool writing_ = false;
     bool finishPending_ = false;  ///< client half-closed while a write was in flight
+
+    // ADR-0004 bounded-outbox state (per-reactor, per Q5 fairness: never a
+    // shared flag on the service). All guarded by m_.
+    std::size_t outboxMaxFrames_;  ///< configured bound (from owner config)
+    std::size_t hwmFrames_;        ///< HWM in frames: refuse at/above this
+    std::size_t lwmFrames_;        ///< LWM in frames: resume at/below this
+    bool backpressured_ = false;   ///< latched at HWM; cleared at LWM crossing
 };
 
 /// Callback gRPC service: GetParticipantInfo (unary) + StreamParticipants (bidi).
@@ -146,8 +190,19 @@ public:
         autoDiscovery::ParticipantData* response) override;
 
     /// Push a reliable payload frame to the subscriber identified by `key`.
-    /// Returns false if no such subscriber is currently connected.
-    bool pushData(const SubscriberKey& key, autoDiscovery::ParticipantData&& frame);
+    /// Returns Accepted when queued, Backpressured when the subscriber's
+    /// outbox is at its high-water mark (frame NOT queued; retryable), and
+    /// NotConnected when no such subscriber is currently connected.
+    OutboxStatus pushData(const SubscriberKey& key, autoDiscovery::ParticipantData&& frame);
+
+    /// Thread-safe: can the subscriber identified by `key` currently accept a
+    /// frame (live, registered, below HWM)? ADR-0004 2C `isSendable()` probe;
+    /// false when no such subscriber is connected.
+    bool isSendable(const SubscriberKey& key);
+
+    /// Thread-safe: current outbox depth of the subscriber identified by
+    /// `key`, or 0 when it is not connected (test/diagnostic probe).
+    std::size_t outboxDepth(const SubscriberKey& key);
 
     /// Owning node (used to build presence from the registry).
     Edriel& owner() const { return owner_; }

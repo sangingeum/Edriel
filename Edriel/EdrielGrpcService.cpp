@@ -21,6 +21,28 @@ namespace {
 
 SubscriberReactor::SubscriberReactor(ParticipantStreamServiceImpl& service)
     : service_(service) {
+    // ADR-0004 bounded outbox: derive the HWM/LWM frame thresholds from the
+    // owner's validated config (config.yml reliable_outbox_* keys, Q6). The
+    // water marks are rounded toward zero so refusal starts strictly AT the
+    // configured fraction and never past the bound itself.
+    const edriel::Config& cfg = service_.owner().config();
+    outboxMaxFrames_ = cfg.reliableOutboxMaxFrames;
+    hwmFrames_ = static_cast<std::size_t>(
+        cfg.reliableOutboxHwm * static_cast<double>(outboxMaxFrames_));
+    lwmFrames_ = static_cast<std::size_t>(
+        cfg.reliableOutboxLwm * static_cast<double>(outboxMaxFrames_));
+    // Coherence guard (config already validates lwm < hwm; this also protects
+    // programmatic Config use): HWM must be at least 1 frame inside the bound
+    // and LWM strictly below HWM, or the gate degenerates.
+    if (hwmFrames_ == 0) {
+        hwmFrames_ = 1;
+    }
+    if (hwmFrames_ >= outboxMaxFrames_) {
+        hwmFrames_ = outboxMaxFrames_ - 1;
+    }
+    if (lwmFrames_ >= hwmFrames_) {
+        lwmFrames_ = hwmFrames_ / 2;
+    }
     // Begin draining the dialing subscriber's heartbeat stream.
     StartRead(&heartbeat_);
 }
@@ -113,6 +135,12 @@ void SubscriberReactor::OnWriteDone(bool ok) {
     startWrite_();
     {
         std::lock_guard<std::mutex> lock(m_);
+        // ADR-0004 LWM resume: once the drain brings the outbox to or below
+        // the low-water mark, clear the backpressure latch so pushes are
+        // accepted again. Per-reactor state only (Q5 fairness).
+        if (backpressured_ && outbox_.size() <= lwmFrames_) {
+            backpressured_ = false;
+        }
         finishNow = finishPending_ && !writing_ && outbox_.empty();
     }
     if (finishNow) {
@@ -191,12 +219,20 @@ bool SubscriberReactor::isLive() {
     return !finished_ && !cancelled_;
 }
 
-void SubscriberReactor::enqueue(autoDiscovery::ParticipantData&& frame) {
+OutboxStatus SubscriberReactor::enqueue(autoDiscovery::ParticipantData&& frame) {
     bool needWrite = false;
     {
         std::lock_guard<std::mutex> lock(m_);
         if (finished_ || cancelled_) {
-            return;  // stream is terminating; drop frames, do not touch the wire
+            return OutboxStatus::NotConnected;  // stream terminating; drop
+        }
+        // ADR-0004 HWM gate: once latched backpressured, refuse until the
+        // drain (OnWriteDone) crosses the LWM and clears the latch. The bound
+        // itself is the hard stop; the HWM is where refusal begins so the
+        // in-flight write + buffered tail never overshoot past the bound.
+        if (backpressured_ || outbox_.size() >= hwmFrames_) {
+            backpressured_ = true;
+            return OutboxStatus::Backpressured;
         }
         outbox_.push_back(std::move(frame));
         needWrite = !writing_;
@@ -204,6 +240,18 @@ void SubscriberReactor::enqueue(autoDiscovery::ParticipantData&& frame) {
     if (needWrite) {
         startWrite_();
     }
+    return OutboxStatus::Accepted;
+}
+
+bool SubscriberReactor::isSendable() {
+    std::lock_guard<std::mutex> lock(m_);
+    return !finished_ && !cancelled_ && !backpressured_
+           && outbox_.size() < hwmFrames_;
+}
+
+std::size_t SubscriberReactor::outboxDepth() {
+    std::lock_guard<std::mutex> lock(m_);
+    return outbox_.size();
 }
 
 void SubscriberReactor::startWrite_() {
@@ -256,18 +304,29 @@ grpc::ServerUnaryReactor* ParticipantStreamServiceImpl::GetParticipantInfo(
     return new UnaryReactor(std::move(status));
 }
 
-bool ParticipantStreamServiceImpl::pushData(const SubscriberKey& key,
-                                            autoDiscovery::ParticipantData&& frame) {
+OutboxStatus ParticipantStreamServiceImpl::pushData(
+    const SubscriberKey& key, autoDiscovery::ParticipantData&& frame) {
     // Holding subsMutex_ across the enqueue guarantees the reactor stays alive
     // for the whole push: OnDone/OnCancel's guarded unregister blocks on the
     // same mutex, and gRPC deletes the reactor only after OnDone returns.
     std::lock_guard<std::mutex> lock(subsMutex_);
     const auto it = subscribers_.find(key);
     if (it == subscribers_.end()) {
-        return false;
+        return OutboxStatus::NotConnected;
     }
-    it->second->enqueue(std::move(frame));
-    return true;
+    return it->second->enqueue(std::move(frame));
+}
+
+bool ParticipantStreamServiceImpl::isSendable(const SubscriberKey& key) {
+    std::lock_guard<std::mutex> lock(subsMutex_);
+    const auto it = subscribers_.find(key);
+    return it != subscribers_.end() && it->second->isSendable();
+}
+
+std::size_t ParticipantStreamServiceImpl::outboxDepth(const SubscriberKey& key) {
+    std::lock_guard<std::mutex> lock(subsMutex_);
+    const auto it = subscribers_.find(key);
+    return it != subscribers_.end() ? it->second->outboxDepth() : 0;
 }
 
 void ParticipantStreamServiceImpl::registerSubscriber(const SubscriberKey& key,

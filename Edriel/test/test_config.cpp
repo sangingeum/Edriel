@@ -501,3 +501,80 @@ TEST(LoadConfig, MissingAdr003KeysKeepDefaults) {
     EXPECT_EQ(cfg.rxRingSlots, kDefaultRingSlots);
     EXPECT_EQ(cfg.soRcvbufBytes, 0u);
 }
+
+// --- ADR-0004 reliable-path backpressure keys ------------------------------
+
+TEST(LoadConfig, ParsesAdr0004Keys) {
+    const auto path = writeTempConfig(
+        "port: 31000\n"
+        "multicast_ip: 224.0.0.11\n"
+        "discovery_period_seconds: 3\n"
+        "participant_timeout_seconds: 12\n"
+        "grpc_port: 4500\n"
+        "max_advertised_endpoints: 6\n"
+        "reliable_outbox_max_frames: 2048\n"
+        "reliable_outbox_hwm: 0.8\n"
+        "reliable_outbox_lwm: 0.2\n"
+        "reliable_send_rate_limit: 5000\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.reliableOutboxMaxFrames, 2048u);
+    EXPECT_DOUBLE_EQ(cfg.reliableOutboxHwm, 0.8);
+    EXPECT_DOUBLE_EQ(cfg.reliableOutboxLwm, 0.2);
+    EXPECT_EQ(cfg.reliableSendRateLimit, 5000u);
+    EXPECT_FALSE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, MissingAdr0004KeysKeepDefaults) {
+    const auto path = writeTempConfig(
+        "port: 30002\n"
+        "multicast_ip: 224.0.0.11\n"
+        "discovery_period_seconds: 3\n"
+        "participant_timeout_seconds: 12\n"
+        "grpc_port: 4500\n"
+        "max_advertised_endpoints: 6\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.reliableOutboxMaxFrames,
+              edriel::kDefaultReliableOutboxMaxFrames);
+    EXPECT_DOUBLE_EQ(cfg.reliableOutboxHwm, edriel::kDefaultReliableOutboxHwm);
+    EXPECT_DOUBLE_EQ(cfg.reliableOutboxLwm, edriel::kDefaultReliableOutboxLwm);
+    EXPECT_EQ(cfg.reliableSendRateLimit,
+              edriel::kDefaultReliableSendRateLimit);
+    EXPECT_FALSE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, InvalidAdr0004KeysFallBack) {
+    // 0 bound, out-of-range water marks, negative rate limit.
+    const auto path = writeTempConfig(
+        "reliable_outbox_max_frames: 0\n"
+        "reliable_outbox_hwm: 1.5\n"
+        "reliable_outbox_lwm: -0.2\n"
+        "reliable_send_rate_limit: -3\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.reliableOutboxMaxFrames,
+              edriel::kDefaultReliableOutboxMaxFrames);
+    EXPECT_DOUBLE_EQ(cfg.reliableOutboxHwm, edriel::kDefaultReliableOutboxHwm);
+    EXPECT_DOUBLE_EQ(cfg.reliableOutboxLwm, edriel::kDefaultReliableOutboxLwm);
+    // Rate limit is validated independently of the outbox trio.
+    EXPECT_EQ(cfg.reliableSendRateLimit,
+              edriel::kDefaultReliableSendRateLimit);
+    EXPECT_TRUE(cfg.fellBackToDefaults);
+}
+
+TEST(LoadConfig, SwappedWaterMarksFallBackTogether) {
+    // lwm >= hwm violates the cross-validation: the trio falls back as a
+    // whole so the gate stays coherent.
+    const auto path = writeTempConfig(
+        "reliable_outbox_max_frames: 2048\n"
+        "reliable_outbox_hwm: 0.3\n"
+        "reliable_outbox_lwm: 0.6\n");
+
+    const edriel::Config cfg = edriel::loadConfig(path.string());
+    EXPECT_EQ(cfg.reliableOutboxMaxFrames,
+              edriel::kDefaultReliableOutboxMaxFrames);
+    EXPECT_DOUBLE_EQ(cfg.reliableOutboxHwm, edriel::kDefaultReliableOutboxHwm);
+    EXPECT_DOUBLE_EQ(cfg.reliableOutboxLwm, edriel::kDefaultReliableOutboxLwm);
+    EXPECT_TRUE(cfg.fellBackToDefaults);
+}

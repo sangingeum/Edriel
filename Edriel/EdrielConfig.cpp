@@ -20,6 +20,7 @@
 #include <fstream>    // std::ifstream
 #include <iterator>   // std::istreambuf_iterator
 #include <limits>     // std::numeric_limits
+#include <stdexcept>  // std::stod exception classes
 #include <string_view> // std::string_view
 
 namespace edriel {
@@ -100,6 +101,58 @@ std::size_t parseRingSlots(const std::string& value, std::size_t fallback) {
         return fallback;
     }
     return static_cast<std::size_t>(parsed);
+}
+
+// ADR-0004: strict positive decimal frame bound. Non-numeric, 0, or trailing
+// junk -> fallback. A sane hard ceiling rejects pathological memory bounds.
+std::size_t parseOutboxMaxFrames(const std::string& value, std::size_t fallback) {
+    unsigned long long parsed = 0;
+    const char* begin = value.data();
+    const char* end = begin + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed, 10);
+
+    if (ec != std::errc{} || ptr != end || parsed == 0) {
+        return fallback;
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
+// ADR-0004: strict water-mark fraction in `minVal < parsed < maxVal` (open
+// interval, so 0, 1, and equal marks all fall back). Scientific notation is
+// not accepted — same strictness as every other config key here.
+double parseWaterMark(const std::string& value,
+                      double minVal, double maxVal, double fallback) {
+    if (value.empty()) {
+        return fallback;
+    }
+    std::size_t consumed = 0;
+    double parsed = 0.0;
+    try {
+        parsed = std::stod(value, &consumed);
+    } catch (const std::exception&) {
+        return fallback;  // not a number at all
+    }
+    if (consumed != value.size()) {
+        return fallback;  // trailing junk
+    }
+    if (!(parsed > minVal && parsed < maxVal)) {
+        return fallback;
+    }
+    return parsed;
+}
+
+// ADR-0004: strict non-negative integer frames/s ceiling; empty/negative
+// junk -> fallback (0 = unlimited).
+std::uint32_t parseRateLimit(const std::string& value, std::uint32_t fallback) {
+    unsigned long long parsed = 0;
+    const char* begin = value.data();
+    const char* end = begin + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed, 10);
+
+    if (ec != std::errc{} || ptr != end) {
+        return fallback;
+    }
+    return static_cast<std::uint32_t>(parsed);
 }
 
 std::string parseMulticastAddress(const std::string& value,
@@ -285,6 +338,77 @@ Config loadConfig(const std::string& configPath) {
                 rcvNode.as<std::string>(), 0, kMaxSoRcvbufBytes, sentinel);
             if (parsed != sentinel) {
                 config.soRcvbufBytes = parsed;
+            } else {
+                config.fellBackToDefaults = true;  // invalid -> default kept
+            }
+        }
+        // ADR-0004 reliable-path backpressure keys (strict per-key validation,
+        // same convention as the ADR-003 block above: an ABSENT key keeps its
+        // default without flagging a fallback; only a present-but-invalid
+        // value does). lwm < hwm is cross-validated AFTER the individual keys
+        // so a swapped pair falls back as a whole.
+        {
+            const bool hwmKeyPresent = [&root]() {
+                const YAML::Node n = root["reliable_outbox_hwm"];
+                return n && n.IsScalar();
+            }();
+            const bool lwmKeyPresent = [&root]() {
+                const YAML::Node n = root["reliable_outbox_lwm"];
+                return n && n.IsScalar();
+            }();
+            bool outboxInvalid = false;
+            if (const YAML::Node outNode = root["reliable_outbox_max_frames"];
+                outNode && outNode.IsScalar()) {
+                const std::size_t sentinel = 0;  // 0 never valid
+                const std::size_t parsed = parseOutboxMaxFrames(
+                    outNode.as<std::string>(), sentinel);
+                if (parsed != 0) {
+                    config.reliableOutboxMaxFrames = parsed;
+                } else {
+                    outboxInvalid = true;
+                }
+            }
+            double hwm = config.reliableOutboxHwm;
+            double lwm = config.reliableOutboxLwm;
+            if (hwmKeyPresent) {
+                const double parsed = parseWaterMark(
+                    root["reliable_outbox_hwm"].as<std::string>(), 0.0, 1.0,
+                    -1.0);
+                if (parsed > 0.0) {
+                    hwm = parsed;
+                } else {
+                    outboxInvalid = true;
+                }
+            }
+            if (lwmKeyPresent) {
+                const double parsed = parseWaterMark(
+                    root["reliable_outbox_lwm"].as<std::string>(), 0.0, 1.0,
+                    -1.0);
+                if (parsed > 0.0) {
+                    lwm = parsed;
+                } else {
+                    outboxInvalid = true;
+                }
+            }
+            if (outboxInvalid || !(lwm < hwm)) {
+                // Any invalid member (or lwm >= hwm) resets the whole trio to
+                // the documented fallbacks so the trio stays coherent.
+                config.reliableOutboxMaxFrames = kDefaultReliableOutboxMaxFrames;
+                config.reliableOutboxHwm = kDefaultReliableOutboxHwm;
+                config.reliableOutboxLwm = kDefaultReliableOutboxLwm;
+                config.fellBackToDefaults = true;
+            } else {
+                config.reliableOutboxHwm = hwm;
+                config.reliableOutboxLwm = lwm;
+            }
+        }
+        if (const YAML::Node rateNode = root["reliable_send_rate_limit"];
+            rateNode && rateNode.IsScalar()) {
+            const std::uint32_t sentinel = std::numeric_limits<std::uint32_t>::max();
+            const std::uint32_t parsed = parseRateLimit(
+                rateNode.as<std::string>(), sentinel);
+            if (parsed != sentinel) {
+                config.reliableSendRateLimit = parsed;
             } else {
                 config.fellBackToDefaults = true;  // invalid -> default kept
             }

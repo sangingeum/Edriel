@@ -66,6 +66,23 @@ inline constexpr std::uint32_t kDefaultSoRcvbufBytes{ 0 };
 /// Upper bound for `so_rcvbuf_bytes` (1 << 30) per the ADR-003 table.
 inline constexpr std::uint32_t kMaxSoRcvbufBytes{ 1u << 30 };
 
+// ---------------------------------------------------------------------------
+// ADR-0004 reliable-path backpressure knobs (and their per-key fallbacks).
+// ---------------------------------------------------------------------------
+
+/// Default per-subscriber outbox bound (frames). Comfortably above the
+/// 256-frame receiver window (ADR-0004 Q6 recommendation: >= 512).
+/// Invalid/non-positive -> 1024.
+inline constexpr std::size_t kDefaultReliableOutboxMaxFrames{ 1024 };
+/// Default high-water mark (fraction of the bound): pushes are refused at or
+/// above this fill level. Out-of-range (not 0 < hwm < 1) -> 0.75.
+inline constexpr double kDefaultReliableOutboxHwm{ 0.75 };
+/// Default low-water mark (fraction of the bound): pushes resume when the
+/// outbox drains to or below this level. Must satisfy lwm < hwm.
+inline constexpr double kDefaultReliableOutboxLwm{ 0.25 };
+/// Default sender-side pacing ceiling (frames/s). 0 = unlimited (default off).
+inline constexpr std::uint32_t kDefaultReliableSendRateLimit{ 0 };
+
 /**
  * @struct Config
  * @brief Validated auto-discovery endpoint and cadence configuration.
@@ -118,6 +135,24 @@ struct Config {
     /// SO_RCVBUF in bytes on the UDP receive socket ([0, 1<<30], default 0 =
     /// leave the OS default). Tuned once a baseline exists.
     std::uint32_t soRcvbufBytes = kDefaultSoRcvbufBytes;
+
+    // -----------------------------------------------------------------------
+    // ADR-0004 reliable-path backpressure knobs.
+    // -----------------------------------------------------------------------
+    /// Per-subscriber reliable outbox bound (frames, default 1024). At the
+    /// high-water mark the publisher's push is refused (Backpressured) until
+    /// the outbox drains to the low-water mark. Worst-case publisher memory:
+    /// subscribers x bound frames.
+    std::size_t reliableOutboxMaxFrames = kDefaultReliableOutboxMaxFrames;
+    /// High-water mark as a fraction of the bound (0 < hwm < 1, default 0.75).
+    double reliableOutboxHwm = kDefaultReliableOutboxHwm;
+    /// Low-water mark as a fraction of the bound (0 < lwm < hwm, default
+    /// 0.25). Pushes resume once the outbox drains to or below this level.
+    double reliableOutboxLwm = kDefaultReliableOutboxLwm;
+    /// Optional sender-side pacing ceiling (frames/s, 0 = unlimited, default
+    /// off). ADR-0004 Option 1D complement: bounds the publisher's own
+    /// offering rate regardless of subscriber health.
+    std::uint32_t reliableSendRateLimit = kDefaultReliableSendRateLimit;
 
     /// True when one or more config.yml keys were missing or invalid and a
     /// default was substituted (diagnostics only). Also drives the
