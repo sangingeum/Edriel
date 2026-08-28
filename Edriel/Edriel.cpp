@@ -1536,7 +1536,12 @@ ReliableSendResult Edriel::tryPublishReliable(
         std::lock_guard<std::mutex> lock(rateLimitMutex_);
         const auto now = std::chrono::steady_clock::now();
         if (rateLimitLastRefill_ == std::chrono::steady_clock::time_point{}) {
-            rateLimitLastRefill_ = now;  // first paced send: bucket starts full
+            rateLimitLastRefill_ = now;
+            // Bucket starts FULL (1s worth of tokens, same cap as refill):
+            // without this the very first paced send is wrongly refused
+            // (tokens_ == 0 < 1.0) despite a nominally full bucket.
+            rateLimitTokens_ =
+                static_cast<double>(config_.reliableSendRateLimit);
         }
         const auto elapsed = now - rateLimitLastRefill_;
         const double refill = std::chrono::duration<double>(elapsed).count()

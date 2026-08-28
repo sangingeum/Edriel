@@ -1,6 +1,6 @@
 ---
 title: "ADR-0004: Reliable-Path Backpressure (Bounded Outbox, Tri-State Send)"
-status: "Proposed"
+status: "Accepted (implemented; butler decision round 2026-08-27, gates passed 2026-08-28)"
 date: "2026-08-27"
 authors: "solomon (architect) — decision proposal for owner"
 ---
@@ -217,6 +217,27 @@ stalls or the window rolls and the frame is "delivered" as a gap).
 This is the strongest argument *for* try-send (2A) over blocking (2B): a
 refusal is a clean, pre-commit, retryable state; a blocking send inside the
 current lock discipline is where tid lifecycle and deadlock hazards multiply.
+
+> **ERRATA (2026-08, post-implementation review): same-tid retry covers ONLY
+> the all-refused case — not partial fan-out.** Rule 3's narrative above
+> describes a partial-fan-out same-tid re-offer that the implementation
+> deliberately does not perform and cannot perform: once ANY live subscriber
+> accepts, `tryPublishReliable` returns `Sent` (the tid is committed) and
+> there is no API surface to re-offer a committed tid to a subscriber that
+> refused. Empirically confirmed by the fairness-test root-cause
+> investigation (`t_143a98cf`: a backpressured subscriber's reactor can keep
+> draining into socket buffers, so it can still be the accepting side while
+> another subscriber refuses). Consequences, binding on callers: **(a)**
+> same-tid retry applies only when ALL live subscribers refused
+> (`Backpressured`, tid uncommitted); **(b)** under partial acceptance, the
+> refused subscriber's window gap is permanent at the transport level —
+> "Sent" means "committed (≥1 accepted)", never "all subscribers will
+> deliver"; **(c)** the only safe fan-out calling pattern is the
+> `isSendable()` all-gate — offer a frame only while every live subscriber
+> reports sendable (as implemented in `benchmark_reliable.cpp` B3 and
+> documented in the README behavior-change note); **(d)** a future
+> `reOfferCommittedTid(subscriberKey)` surface is noted for v2 — deferred;
+> the gate pattern is simpler and lossless by construction.
 
 ## Q4 — Partial fan-out
 
